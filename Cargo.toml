@@ -1,0 +1,37 @@
+[package]
+name = "lite-encoder"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+description = "A focused media processor: RTSP ingest, long-running supervised recording jobs, WebM output."
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs"] }
+futures = "0.3"
+retina = "0.4"
+h264-reader = "0.8"
+bytes = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[features]
+default = []
+# AV1 encode via rav1e. Off by default: heavy build, only needed for the transcode path.
+av1 = ["dep:rav1e"]
+
+[dependencies.rav1e]
+version = "0.8"
+optional = true
+default-features = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[dev-dependencies]
+bytes = "1"
