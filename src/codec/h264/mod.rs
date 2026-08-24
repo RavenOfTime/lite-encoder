@@ -45,5 +45,10 @@
 //! the [`crate::media::Decoder`] seam to run this decoder and a reference
 //! side by side over the same stream and compare per-frame hashes.
 
+pub mod cabac;
+pub mod cabac_tables;
+pub mod deblock;
+pub mod deblock_tables;
+pub mod inter;
 pub mod intra;
 pub mod transform;
