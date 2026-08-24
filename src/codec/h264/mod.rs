@@ -55,7 +55,9 @@ pub mod deblock_tables;
 pub mod differential;
 pub mod inter;
 pub mod intra;
+pub mod mb;
 pub mod neighbour;
 #[cfg(feature = "reference-decoder")]
 pub mod reference;
+pub mod residual;
 pub mod transform;
