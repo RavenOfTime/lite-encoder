@@ -45,10 +45,15 @@
 //! the [`crate::media::Decoder`] seam to run this decoder and a reference
 //! side by side over the same stream and compare per-frame hashes.
 
+pub mod annexb;
 pub mod cabac;
 pub mod cabac_tables;
 pub mod deblock;
 pub mod deblock_tables;
+#[cfg(feature = "reference-decoder")]
+pub mod differential;
 pub mod inter;
 pub mod intra;
+#[cfg(feature = "reference-decoder")]
+pub mod reference;
 pub mod transform;

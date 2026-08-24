@@ -23,6 +23,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 default = []
 # AV1 encode via rav1e. Off by default: heavy build, only needed for the transcode path.
 av1 = ["dep:rav1e"]
+# The openh264 reference decoder, used as a differential oracle in tests.
+# Off by default and never enabled in a shipping build: it compiles vendored
+# C, which is exactly what the pure-Rust decoder exists to avoid. See
+# `codec::h264::reference`.
+reference-decoder = ["dep:openh264"]
 
 [dependencies.rav1e]
 version = "0.8"
@@ -38,6 +43,14 @@ features = ["asm", "threading"]
 [[example]]
 name = "bench_rav1e"
 required-features = ["av1"]
+
+# Cisco's H.264 implementation, built from vendored C. Test-only oracle, so it
+# is a plain optional dependency rather than a dev-dependency: Cargo does not
+# allow dev-dependencies to be optional, and an unconditional one would force
+# the C toolchain on anyone running `cargo test`.
+[dependencies.openh264]
+version = "0.9"
+optional = true
 
 [profile.release]
 opt-level = 3
