@@ -43,7 +43,8 @@
 //! frames visibly rot seconds later. So differential testing against a
 //! reference decoder is wired up from the start rather than bolted on, using
 //! the [`crate::media::Decoder`] seam to run this decoder and a reference
-//! side by side over the same stream and compare per-frame hashes.
+//! side by side over the same stream and compare every decoded sample. See
+//! `differential`, behind the off-by-default `reference-decoder` feature.
 
 pub mod annexb;
 pub mod cabac;
@@ -54,6 +55,7 @@ pub mod deblock_tables;
 pub mod differential;
 pub mod inter;
 pub mod intra;
+pub mod neighbour;
 #[cfg(feature = "reference-decoder")]
 pub mod reference;
 pub mod transform;
