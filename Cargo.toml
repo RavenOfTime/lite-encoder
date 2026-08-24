@@ -27,7 +27,17 @@ av1 = ["dep:rav1e"]
 [dependencies.rav1e]
 version = "0.8"
 optional = true
+# Skip the `binaries` and `git_version` defaults (CLI deps, build-time git),
+# but keep `asm` and `threading`: without them rav1e is several times slower
+# and cannot use more than one core.
 default-features = false
+features = ["asm", "threading"]
+
+# Only builds under `--features av1`; without this the example breaks
+# `cargo test` and `cargo clippy` on a default-feature checkout.
+[[example]]
+name = "bench_rav1e"
+required-features = ["av1"]
 
 [profile.release]
 opt-level = 3

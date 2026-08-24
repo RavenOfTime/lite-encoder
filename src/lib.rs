@@ -9,6 +9,7 @@
 //! send H.264/H.265. So there is no such thing as a cheap RTSP-to-WebM
 //! remux; that path always decodes and re-encodes. See [`job::Treatment`].
 
+pub mod codec;
 pub mod job;
 pub mod media;
 pub mod mux;
