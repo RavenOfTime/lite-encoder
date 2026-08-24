@@ -60,4 +60,6 @@ pub mod neighbour;
 #[cfg(feature = "reference-decoder")]
 pub mod reference;
 pub mod residual;
+pub mod state;
+pub mod syntax;
 pub mod transform;
