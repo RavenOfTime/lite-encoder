@@ -7,7 +7,8 @@
 
 use h264_reader::nal::pps::{PicParameterSet, PicScalingMatrix};
 use h264_reader::nal::slice::{
-    ModificationOfPicNums, NumRefIdxActive, RefPicListModifications, SliceFamily, SliceHeader,
+    DecRefPicMarking, MemoryManagementControlOperation, ModificationOfPicNums, NumRefIdxActive,
+    PredWeightTable, RefPicListModifications, SliceFamily, SliceHeader,
 };
 use h264_reader::nal::sps::{FrameMbsFlags, ScalingList, SeqParameterSet, SeqScalingMatrix};
 use h264_reader::nal::{NalHeader, UnitType};
@@ -16,7 +17,7 @@ use h264_reader::Context;
 
 use crate::Error;
 
-use super::picture::{Cropping, RefListMod};
+use super::picture::{Cropping, MmcoOp, RefListMod, RefMarking};
 use super::recon::{ScalingListSyntax, ScalingLists};
 
 /// Header details consumed by the macroblock layer.
@@ -98,6 +99,9 @@ pub struct CabacSlice {
     /// Short-term `ref_pic_list_modification` commands for list 0. Empty when
     /// the slice uses the default descending-`PicNum` order.
     pub list_mods: Vec<RefListMod>,
+    /// How this picture updates the DPB after decode (spec 8.2.5). Disposable
+    /// NALs (`nal_ref_idc == 0`) carry [`RefMarking::None`].
+    pub marking: RefMarking,
     /// RBSP bytes holding CABAC data. `bit_offset` identifies its first bit.
     pub data: Vec<u8>,
     pub bit_offset: u8,
@@ -145,7 +149,9 @@ pub fn parse_cabac(ctx: &Context, nal: &[u8]) -> Result<CabacSlice, Error> {
             return Err(decode("SP/SI slices are outside decoder scope"))
         }
     };
+    reject_pred_weight_table(header_data.pred_weight_table.as_ref())?;
     let list_mods = short_term_list_mods(&header_data.ref_pic_list_modification)?;
+    let marking = ref_marking(&header_data.dec_ref_pic_marking)?;
     let slice_qp = (26 + pps.pic_init_qp_minus26 + header_data.slice_qp_delta)
         .try_into()
         .map_err(|_| decode("slice quantiser outside 0..=51"))?;
@@ -218,6 +224,7 @@ pub fn parse_cabac(ctx: &Context, nal: &[u8]) -> Result<CabacSlice, Error> {
         },
         scaling: scaling_lists(sps, pps),
         list_mods,
+        marking,
         data: rbsp[cabac_start / 8..].to_vec(),
         bit_offset: (cabac_start % 8) as u8,
     })
@@ -317,9 +324,7 @@ fn skip_cabac_alignment(rbsp: &[u8], header_end: usize) -> Result<usize, Error> 
 }
 
 /// Collects short-term L0 modifications; rejects long-term reordering.
-fn short_term_list_mods(
-    mods: &Option<RefPicListModifications>,
-) -> Result<Vec<RefListMod>, Error> {
+fn short_term_list_mods(mods: &Option<RefPicListModifications>) -> Result<Vec<RefListMod>, Error> {
     let commands = match mods {
         Some(RefPicListModifications::P {
             ref_pic_list_modification_l0,
@@ -344,6 +349,58 @@ fn short_term_list_mods(
         }
     }
     Ok(out)
+}
+
+fn reject_pred_weight_table(table: Option<&PredWeightTable>) -> Result<(), Error> {
+    if table.is_some() {
+        return Err(decode("weighted prediction is outside decoder scope"));
+    }
+    Ok(())
+}
+
+/// Maps `dec_ref_pic_marking` into the short-term ops this decoder supports.
+fn ref_marking(marking: &Option<DecRefPicMarking>) -> Result<RefMarking, Error> {
+    Ok(match marking {
+        None => RefMarking::None,
+        Some(DecRefPicMarking::SlidingWindow) => RefMarking::SlidingWindow,
+        Some(DecRefPicMarking::Idr {
+            long_term_reference_flag,
+            ..
+        }) => {
+            if *long_term_reference_flag {
+                return Err(decode(
+                    "IDR long_term_reference_flag is outside decoder scope",
+                ));
+            }
+            // `no_output_of_prior_pics_flag` is a no-op here: there are no B
+            // slices and therefore no delayed pictures waiting to be output.
+            RefMarking::Idr
+        }
+        Some(DecRefPicMarking::Adaptive(ops)) => {
+            let mut out = Vec::with_capacity(ops.len());
+            for op in ops {
+                match op {
+                    MemoryManagementControlOperation::ShortTermUnusedForRef {
+                        difference_of_pic_nums_minus1,
+                    } => out.push(MmcoOp::ShortTermUnused {
+                        difference_of_pic_nums_minus1: *difference_of_pic_nums_minus1,
+                    }),
+                    MemoryManagementControlOperation::AllRefPicturesUnused => {
+                        out.push(MmcoOp::AllUnused)
+                    }
+                    MemoryManagementControlOperation::LongTermUnusedForRef { .. }
+                    | MemoryManagementControlOperation::ShortTermUsedForLongTerm { .. }
+                    | MemoryManagementControlOperation::MaxUsedLongTermFrameRef { .. }
+                    | MemoryManagementControlOperation::CurrentUsedForLongTerm { .. } => {
+                        return Err(decode(
+                            "long-term dec_ref_pic_marking is outside decoder scope",
+                        ))
+                    }
+                }
+            }
+            RefMarking::Adaptive(out)
+        }
+    })
 }
 
 fn nal_header(nal: &[u8]) -> Result<NalHeader, Error> {
@@ -510,6 +567,40 @@ mod tests {
         let nal = [0x21, 0xe2, 0x27, 0x23, 0x5f, 0xff];
         let slice = parse_cabac(&ctx, &nal).expect("parse");
         assert_eq!(slice.list_mods, [RefListMod::Subtract(0)]);
+        assert_eq!(slice.marking, RefMarking::SlidingWindow);
+    }
+
+    #[test]
+    fn camera_fixture_p_slices_use_adaptive_mmco() {
+        let mut frontend = super::super::decoder::Frontend::new();
+        let mut saw_adaptive = false;
+        for access_unit in super::super::annexb::access_units(CAMERA_FIXTURE) {
+            let slices = frontend.parse_access_unit(access_unit).expect("parse");
+            for slice in slices {
+                if matches!(slice.marking, RefMarking::Adaptive(_)) {
+                    assert_eq!(
+                        slice.marking,
+                        RefMarking::Adaptive(vec![MmcoOp::ShortTermUnused {
+                            difference_of_pic_nums_minus1: 0,
+                        }])
+                    );
+                    saw_adaptive = true;
+                }
+            }
+        }
+        assert!(saw_adaptive, "fixture P slices should carry MMCO-1");
+    }
+
+    #[test]
+    fn long_term_mmco_is_rejected() {
+        use h264_reader::nal::slice::MemoryManagementControlOperation;
+        let marking = Some(DecRefPicMarking::Adaptive(vec![
+            MemoryManagementControlOperation::CurrentUsedForLongTerm {
+                long_term_frame_idx: 0,
+            },
+        ]));
+        let err = ref_marking(&marking).unwrap_err();
+        assert!(err.to_string().contains("long-term"));
     }
 
     #[test]
@@ -519,5 +610,18 @@ mod tests {
         });
         let err = short_term_list_mods(&modified).unwrap_err();
         assert!(err.to_string().contains("long-term"));
+    }
+
+    #[test]
+    fn prediction_weight_table_is_rejected() {
+        let table = PredWeightTable {
+            luma_log2_weight_denom: 0,
+            chroma_log2_weight_denom: Some(0),
+            luma_weights: Vec::new(),
+            chroma_weights: Vec::new(),
+        };
+        let err = reject_pred_weight_table(Some(&table)).unwrap_err();
+        assert!(err.to_string().contains("weighted prediction"));
+        assert!(reject_pred_weight_table(None).is_ok());
     }
 }

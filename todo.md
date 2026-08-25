@@ -10,15 +10,15 @@ support come after that vertical slice works.
   - [x] Replace the `let ... else` in `src/codec/h264/loopfilter.rs` with `?`.
   - [x] Refactor or explicitly justify the 8-argument `intra_sample` helper in
         `src/codec/h264/recon.rs`.
-- [ ] Run and pass `cargo fmt --check`, `cargo test`, and
+- [x] Run and pass `cargo fmt --check`, `cargo test`, and
       `cargo clippy --all-targets -- -D warnings`.
-  - [x] `cargo test` (200 lib + 2 integration) and
-        `cargo test --features reference-decoder` (212 lib + 3 integration)
+  - [x] `cargo test` (209 lib + 2 integration) and
+        `cargo test --features reference-decoder` (223 lib + 3 integration)
         both pass.
   - [x] `cargo clippy --all-targets -- -D warnings` clean on default features
         and on `--features reference-decoder`.
   - [x] `cargo fmt --check` passes after formatting the working tree.
-  - [ ] `cargo build --features av1` has not been run against this tree.
+  - [x] `cargo build --features av1` passes.
 - [x] Run the OpenH264 differential suite with `--features reference-decoder`.
 - [x] Run `diff_h264` over `camera.h264` and confirm every decoded sample still
       matches the reference for the full capture (224 pictures).
@@ -89,15 +89,16 @@ needs, and only with differential proof.
       spec 8.2.4.3.1 before inter prediction. Long-term modifications are
       rejected. The camera fixture's `Subtract(0)` path is covered by unit
       tests and still bit-exact on the regression fixture.
-- [ ] **`weighted_pred_flag` / `pred_weight_table` are ignored.** Weighted P
-      slices receive unweighted prediction. Cameras enable this around IR-cut
-      day/night transitions. Reject or implement.
-- [ ] **PARTIAL:** **`dec_ref_pic_marking` MMCO operations and long-term
-      references are ignored.** Only the sliding window of 8.2.5.3 exists, and
-      IDR `long_term_reference_flag` / `no_output_of_prior_pics_flag` are
-      dropped. The Tapo fixture emits adaptive MMCO op 1 (mark previous unused)
-      which coincides with capacity-1 sliding-window eviction — still implement
-      or reject explicitly. Reject adaptive marking, or implement it.
+- [x] **DONE (Codex): Reject weighted P prediction.** PPS registration rejects
+      `weighted_pred_flag`, and the standalone slice parser independently
+      rejects any parsed `pred_weight_table`, preventing silent unweighted
+      reconstruction.
+- [x] **DONE (Auto): Short-term `dec_ref_pic_marking`.** Sliding window, IDR
+      (no long-term), and adaptive MMCO ops 1 (`ShortTermUnused`) and 5
+      (`AllUnused`) are applied via `Dpb::mark_reference` after decode.
+      Long-term MMCO / IDR `long_term_reference_flag` are rejected. The Tapo
+      fixture's adaptive mark-previous-unused path is covered by unit tests
+      and still bit-exact on the regression fixture.
 - [ ] **Redundant coded pictures are not discarded.** `redundant_pic_cnt` is
       never inspected, so a redundant slice would be decoded as ordinary
       picture data. Reject when `redundant_pic_cnt_present_flag` is set.
@@ -118,9 +119,19 @@ needs, and only with differential proof.
 
 ## P1 — Complete the transcode path
 
-- [ ] Implement a production AV1 `media::Encoder` backed by the optional
-      `rav1e` dependency. Nothing in `src/` implements `media::Encoder` today;
-      the only rav1e code is `examples/bench_rav1e.rs`.
+- [x] **DONE (Auto):** Implement a production AV1 `media::Encoder` backed by
+      the optional `rav1e` dependency. `codec::av1::Av1Encoder`
+      (`src/codec/av1/mod.rs`, behind the `av1` feature) uses the benchmarked
+      speed-8/4-tile/low-latency configuration from `bench_rav1e.rs`
+      (~2x real time at 640x360), tracks PTS per rav1e `input_frameno` so
+      packets keep their originating frame's timestamp, and exposes
+      `container_sequence_header()` as `extra_data()` for the WebM
+      `CodecPrivate`. Also fixed a pre-existing strict-Clippy failure in
+      `examples/bench_rav1e.rs` (`field_reassign_with_default`) that blocked
+      `cargo clippy --all-targets --features av1`. Unit-tested in isolation
+      (keyframe + PTS on first packet, size mismatch rejected, non-empty
+      `av1C`, flush drains every sent frame) — **not yet wired into the job
+      runner**, which does not exist yet either (see the next section).
 - [ ] Define timestamp/time-base handling between decoded `Frame`s, encoded
       `Packet`s, and the WebM muxer.
 - [ ] Map encoder keyframes to WebM cluster/segment boundaries and make forced

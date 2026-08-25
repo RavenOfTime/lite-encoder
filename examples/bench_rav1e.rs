@@ -55,20 +55,22 @@ fn bench(
     tiles: usize,
     low_latency: bool,
 ) -> Result<(f64, usize), Box<dyn std::error::Error>> {
-    let mut enc = EncoderConfig::default();
-    enc.width = WIDTH;
-    enc.height = HEIGHT;
-    enc.bit_depth = 8;
-    enc.chroma_sampling = ChromaSampling::Cs420;
-    enc.time_base = Rational::new(1, FPS);
-    enc.speed_settings = SpeedSettings::from_preset(speed);
-    enc.bitrate = BITRATE;
-    // A supervised recorder wants bounded latency and regular seek points, not
-    // the multi-second lookahead a file encoder would use.
-    enc.low_latency = low_latency;
-    enc.tiles = tiles;
-    enc.min_key_frame_interval = FPS * 2;
-    enc.max_key_frame_interval = FPS * 2;
+    let enc = EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        bit_depth: 8,
+        chroma_sampling: ChromaSampling::Cs420,
+        time_base: Rational::new(1, FPS),
+        speed_settings: SpeedSettings::from_preset(speed),
+        bitrate: BITRATE,
+        // A supervised recorder wants bounded latency and regular seek
+        // points, not the multi-second lookahead a file encoder would use.
+        low_latency,
+        tiles,
+        min_key_frame_interval: FPS * 2,
+        max_key_frame_interval: FPS * 2,
+        ..Default::default()
+    };
 
     let cfg = Config::new().with_encoder_config(enc).with_threads(threads);
     let mut ctx: Context<u8> = cfg.new_context()?;

@@ -96,9 +96,12 @@ pictures, and ordinary non-VCL metadata such as SEI and access-unit delimiters.
 It explicitly rejects interlacing (PAFF/MBAFF), non-8-bit video, monochrome,
 4:2:2 and 4:4:4 chroma, FMO slice groups, CAVLC, data partitioning, SVC/MVC
 and other extension NAL units, auxiliary/depth pictures, reserved or
-unspecified NAL types, and long-term `ref_pic_list_modification`. Short-term
-list reordering (spec 8.2.4.3.1) is implemented; the Tapo fixture uses
-`Subtract(0)` on P slices. B-slice decoding and H.265 are outside current scope.
+unspecified NAL types, weighted P prediction, and long-term reference
+tools (`ref_pic_list_modification` long-term commands, long-term MMCO, IDR
+`long_term_reference_flag`). Short-term list reordering (spec 8.2.4.3.1) and
+short-term adaptive marking (MMCO 1 and 5) plus the sliding window are
+implemented; the Tapo fixture uses `Subtract(0)` and MMCO-1 on P slices.
+B-slice decoding and H.265 are outside current scope.
 
 The checked-in camera fixture (`tests/fixtures/tapo-1080p-cabac-8x8.h264`) is
 four 1080p pictures; see `tests/fixtures/README.md`. The full local capture

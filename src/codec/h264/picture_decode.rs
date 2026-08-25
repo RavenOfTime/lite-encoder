@@ -9,7 +9,7 @@ use super::inter;
 use super::loopfilter::{self, FilterParams};
 use super::mb::{self, MbType, Partitioning};
 use super::neighbour::MbAddr;
-use super::picture::{Cropping, Dpb, Picture};
+use super::picture::{Cropping, Dpb, Picture, RefMarking};
 use super::recon::{self, ReconParams, Residual};
 use super::residual::{self, BlockCat};
 use super::slice::{CabacSlice, Deblocking, PictureConfig, SliceInfo, SliceKind};
@@ -26,8 +26,8 @@ pub struct Finished {
     pub dpb: Dpb,
     /// The macroblock state store, to be reset and used again.
     pub state: PictureState,
-    /// A picture buffer the DPB no longer needs, if it evicted one.
-    pub recycled: Option<Picture>,
+    /// Picture buffers the DPB no longer needs (MMCO and/or sliding window).
+    pub recycled: Vec<Picture>,
 }
 
 /// The mutable state of one picture.  Keeping these fields together prevents
@@ -158,7 +158,12 @@ impl PictureDecoder {
     /// picture itself can then move into the DPB rather than being cloned into
     /// it. The order matters only for cost, not for correctness: both the
     /// frame and the reference are the deblocked picture.
-    pub fn finish(mut self, crop: Cropping, pts: Duration, is_reference: bool) -> Finished {
+    pub fn finish(
+        mut self,
+        crop: Cropping,
+        pts: Duration,
+        marking: &RefMarking,
+    ) -> Result<Finished, Error> {
         // Concealment before the filter: unclaimed macroblocks must not keep
         // whatever samples a recycled buffer held, and the filter already
         // skips them so greying first is order-independent for correctness
@@ -173,17 +178,16 @@ impl PictureDecoder {
             },
         );
         let frame = self.picture.to_frame(crop, pts);
-        let recycled = if is_reference {
-            self.dpb.push(self.picture)
-        } else {
-            Some(self.picture)
+        let recycled = match marking {
+            RefMarking::None => vec![self.picture],
+            marking => self.dpb.mark_reference(self.picture, marking)?,
         };
-        Finished {
+        Ok(Finished {
             frame,
             dpb: self.dpb,
             state: self.state,
             recycled,
-        }
+        })
     }
 
     fn decode_macroblock(
@@ -713,6 +717,7 @@ fn decode_cbf(
 
 #[cfg(test)]
 mod tests {
+    use super::super::picture::MmcoOp;
     use super::*;
 
     fn config() -> PictureConfig {
@@ -727,10 +732,15 @@ mod tests {
 
     #[test]
     fn reference_picture_enters_the_dpb() {
-        let finished =
-            PictureDecoder::new(config()).finish(Cropping::default(), Duration::ZERO, true);
+        let finished = PictureDecoder::new(config())
+            .finish(
+                Cropping::default(),
+                Duration::ZERO,
+                &RefMarking::SlidingWindow,
+            )
+            .expect("finish");
         assert_eq!(finished.dpb.len(), 1);
-        assert!(finished.recycled.is_none());
+        assert!(finished.recycled.is_empty());
     }
 
     #[test]
@@ -741,10 +751,33 @@ mod tests {
         let _ = decoder.dpb.push(reference);
         decoder.picture.frame_num = 8;
 
-        let finished = decoder.finish(Cropping::default(), Duration::ZERO, false);
+        let finished = decoder
+            .finish(Cropping::default(), Duration::ZERO, &RefMarking::None)
+            .expect("finish");
 
         assert_eq!(finished.dpb.len(), 1);
         assert_eq!(finished.dpb.get(0).unwrap().frame_num, 7);
-        assert_eq!(finished.recycled.unwrap().frame_num, 8);
+        assert_eq!(finished.recycled[0].frame_num, 8);
+    }
+
+    #[test]
+    fn adaptive_mmco_marks_prior_reference_unused() {
+        let mut decoder = PictureDecoder::new(config());
+        let mut prior = Picture::new(1, 1);
+        prior.frame_num = 0;
+        let _ = decoder.dpb.push(prior);
+        decoder.picture.frame_num = 1;
+
+        let marking = RefMarking::Adaptive(vec![MmcoOp::ShortTermUnused {
+            difference_of_pic_nums_minus1: 0,
+        }]);
+        let finished = decoder
+            .finish(Cropping::default(), Duration::ZERO, &marking)
+            .expect("finish");
+
+        assert_eq!(finished.dpb.len(), 1);
+        assert_eq!(finished.dpb.get(0).unwrap().frame_num, 1);
+        assert_eq!(finished.recycled.len(), 1);
+        assert_eq!(finished.recycled[0].frame_num, 0);
     }
 }

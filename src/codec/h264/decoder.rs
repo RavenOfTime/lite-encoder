@@ -104,6 +104,7 @@ impl Frontend {
         };
         let config = first.info.picture;
         let nal_ref_idc = first.info.nal_ref_idc;
+        let marking = first.marking.clone();
         if slices.iter().any(|slice| slice.info.picture != config) {
             return Err(Error::Decode(
                 "access unit mixes picture configurations".into(),
@@ -114,6 +115,16 @@ impl Frontend {
             .any(|slice| slice.info.nal_ref_idc != nal_ref_idc)
         {
             return Err(Error::Decode("access unit mixes nal_ref_idc values".into()));
+        }
+        if slices.iter().any(|slice| slice.marking != marking) {
+            return Err(Error::Decode(
+                "access unit mixes dec_ref_pic_marking values".into(),
+            ));
+        }
+        if (nal_ref_idc == 0) != matches!(marking, super::picture::RefMarking::None) {
+            return Err(Error::Decode(
+                "nal_ref_idc and dec_ref_pic_marking disagree".into(),
+            ));
         }
         if self.config != Some(config) {
             self.spare.clear();
@@ -140,7 +151,7 @@ impl Frontend {
         for (slice_id, slice) in slices.iter().enumerate() {
             picture.decode_slice(slice, slice_id as u32)?;
         }
-        let finished = picture.finish(config.crop, pts, nal_ref_idc != 0);
+        let finished = picture.finish(config.crop, pts, &marking)?;
         self.dpb = Some(finished.dpb);
         self.state = Some(finished.state);
         self.spare.extend(finished.recycled);
@@ -192,6 +203,9 @@ fn validate_sps(sps: &SeqParameterSet) -> Result<(), Error> {
 fn validate_pps(pps: &PicParameterSet) -> Result<(), Error> {
     if pps.slice_groups.is_some() {
         return Err(Error::Decode("FMO slice groups are unsupported".into()));
+    }
+    if pps.weighted_pred_flag {
+        return Err(Error::Decode("weighted P prediction is unsupported".into()));
     }
     Ok(())
 }
@@ -303,5 +317,12 @@ mod tests {
             num_slice_groups_minus1: 1,
         });
         assert!(validate_pps(&pps).unwrap_err().to_string().contains("FMO"));
+
+        let (_, mut weighted) = camera_parameter_sets();
+        weighted.weighted_pred_flag = true;
+        assert!(validate_pps(&weighted)
+            .unwrap_err()
+            .to_string()
+            .contains("weighted P prediction"));
     }
 }

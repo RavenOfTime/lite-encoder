@@ -210,6 +210,29 @@ pub enum RefListMod {
     Add(u32),
 }
 
+/// How a decoded picture updates the DPB (spec 8.2.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefMarking {
+    /// `nal_ref_idc == 0`: display only, never a reference.
+    None,
+    /// Non-IDR reference using the sliding window of 8.2.5.3.
+    SlidingWindow,
+    /// Non-IDR reference with short-term MMCO ops (8.2.5.4).
+    Adaptive(Vec<MmcoOp>),
+    /// IDR reference; the DPB was already cleared at slice start.
+    Idr,
+}
+
+/// Short-term memory-management control operations this decoder accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmcoOp {
+    /// Mark the short-term picture with
+    /// `PicNum = CurrPicNum − (difference_of_pic_nums_minus1 + 1)` unused.
+    ShortTermUnused { difference_of_pic_nums_minus1: u32 },
+    /// Mark every reference picture unused (MMCO 5).
+    AllUnused,
+}
+
 /// The short-term reference pictures available for prediction.
 ///
 /// Ordered most-recent-first, which for a P slice with no reference list
@@ -375,6 +398,67 @@ impl Dpb {
         }
         None
     }
+
+    /// Applies short-term MMCO ops for the picture that just finished decode
+    /// (spec 8.2.5.4), returning any pictures marked unused so their buffers
+    /// can be recycled. Call before pushing the current picture.
+    pub fn apply_mmco(
+        &mut self,
+        curr_pic_num: u16,
+        ops: &[MmcoOp],
+    ) -> Result<Vec<Picture>, crate::Error> {
+        let mut recycled = Vec::new();
+        for op in ops {
+            match *op {
+                MmcoOp::AllUnused => {
+                    recycled.append(&mut self.refs);
+                }
+                MmcoOp::ShortTermUnused {
+                    difference_of_pic_nums_minus1,
+                } => {
+                    let pic_num =
+                        i64::from(curr_pic_num) - (i64::from(difference_of_pic_nums_minus1) + 1);
+                    let idx = self
+                        .refs
+                        .iter()
+                        .position(|p| {
+                            pic_num_of(p.frame_num, curr_pic_num, self.max_frame_num) == pic_num
+                        })
+                        .ok_or_else(|| {
+                            crate::Error::Decode(format!("MMCO targets missing PicNum {pic_num}"))
+                        })?;
+                    recycled.push(self.refs.remove(idx));
+                }
+            }
+        }
+        Ok(recycled)
+    }
+
+    /// Marks `picture` as a short-term reference after applying `marking`.
+    ///
+    /// Adaptive marking runs first; the current picture is then inserted. The
+    /// sliding-window path is used for `SlidingWindow` and `Idr` (IDR already
+    /// cleared the buffer at slice start). Returns every picture freed for
+    /// buffer reuse.
+    pub fn mark_reference(
+        &mut self,
+        picture: Picture,
+        marking: &RefMarking,
+    ) -> Result<Vec<Picture>, crate::Error> {
+        let mut recycled = match marking {
+            RefMarking::None => {
+                return Err(crate::Error::Decode(
+                    "non-reference picture cannot enter the DPB".into(),
+                ))
+            }
+            RefMarking::Adaptive(ops) => self.apply_mmco(picture.frame_num, ops)?,
+            RefMarking::SlidingWindow | RefMarking::Idr => Vec::new(),
+        };
+        if let Some(evicted) = self.push(picture) {
+            recycled.push(evicted);
+        }
+        Ok(recycled)
+    }
 }
 
 /// Spec `FrameNumWrap`: a picture's `frame_num` expressed relative to the
@@ -508,13 +592,30 @@ mod tests {
         let _ = dpb.push(picture_numbered(3));
         // Default L0 for curr=4 is [3, 2, 1]. Subtract(1) selects PicNum 2
         // (curr - 2) for index 0, leaving [2, 3, 1].
-        let list = dpb
-            .list0(4, &[RefListMod::Subtract(1)], 3)
-            .expect("list0");
+        let list = dpb.list0(4, &[RefListMod::Subtract(1)], 3).expect("list0");
         assert_eq!(
             list.iter().map(|p| p.frame_num).collect::<Vec<_>>(),
             vec![2, 3, 1]
         );
+    }
+
+    #[test]
+    fn mmco_short_term_unused_removes_the_named_pic_num() {
+        let mut dpb = Dpb::new(4, 16);
+        let _ = dpb.push(picture_numbered(0));
+        let _ = dpb.push(picture_numbered(1));
+        let recycled = dpb
+            .apply_mmco(
+                2,
+                &[MmcoOp::ShortTermUnused {
+                    difference_of_pic_nums_minus1: 0,
+                }],
+            )
+            .expect("mmco");
+        assert_eq!(recycled.len(), 1);
+        assert_eq!(recycled[0].frame_num, 1);
+        assert_eq!(dpb.len(), 1);
+        assert_eq!(dpb.get(0).unwrap().frame_num, 0);
     }
 
     #[test]
