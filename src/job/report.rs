@@ -48,6 +48,13 @@ pub enum Event {
         expected: Duration,
         got: Duration,
     },
+    /// A decoded picture had macroblocks concealed with mid-grey because no
+    /// slice claimed them. The frame is still emitted so recording can
+    /// continue, but operators need to know the picture is damaged.
+    ConcealedPicture {
+        pts: Duration,
+        concealed_macroblocks: u32,
+    },
     /// Encoder or writer could not keep up and media was dropped. Never
     /// hide this: a recording with silent gaps is worse than a failed one.
     Dropped {

@@ -138,11 +138,19 @@ time at 30 fps, single-threaded release). That leaves half the wall-clock for
 AV1 encode and OS jitter on the same box. The four-picture fixture is too short
 to use as the gate. Measured 2026-08-26: ~129 fps (4.3× @ 30); OpenH264 ~222 fps.
 
+**Encode throughput gate:** best pass of `bench_av1` on the same capture must
+reach **≥30 fps** (1.0× @ 30 fps) using the shipping `Av1Encoder` (speed 8,
+4 tiles, low latency, 2 Mbit/s). Measured 2026-08-26 on the four-picture
+fixture only (gate skipped): ~5.3 fps — well below real time; 1080p continuous
+recording needs a different resolution, preset, or thread budget before the
+runner is built.
+
     cargo test
     cargo test --features reference-decoder codec::h264::differential
     cargo test --features reference-decoder --test h264_camera_regression
     cargo run --features reference-decoder --example diff_h264 -- camera.h264
     cargo run --release --example bench_h264 -- camera.h264
+    cargo run --release --features av1 --example bench_av1 -- camera.h264
 
 ## Layout
 

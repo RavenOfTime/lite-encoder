@@ -27,6 +27,7 @@ pub struct Av1Encoder {
     /// number rather than being read off in send order.
     pending: HashMap<u64, Duration>,
     next_frameno: u64,
+    force_keyframe: bool,
 }
 
 impl Av1Encoder {
@@ -68,17 +69,23 @@ impl Av1Encoder {
             height,
             pending: HashMap::new(),
             next_frameno: 0,
+            force_keyframe: false,
         })
     }
 
-    fn packet_from(&mut self, pkt: rav1e::prelude::Packet<u8>) -> Packet {
-        let pts = self.pending.remove(&pkt.input_frameno).unwrap_or_default();
-        Packet {
+    fn packet_from(&mut self, pkt: rav1e::prelude::Packet<u8>) -> Result<Packet, Error> {
+        let pts = self.pending.remove(&pkt.input_frameno).ok_or_else(|| {
+            Error::Encode(format!(
+                "rav1e returned unknown input frame {}",
+                pkt.input_frameno
+            ))
+        })?;
+        Ok(Packet {
             track: self.track,
             pts,
             keyframe: pkt.frame_type == FrameType::KEY,
             data: pkt.data.into(),
-        }
+        })
     }
 
     /// Drains every packet currently available without blocking for more
@@ -88,7 +95,7 @@ impl Av1Encoder {
         loop {
             match self.ctx.receive_packet() {
                 Ok(pkt) => {
-                    let packet = self.packet_from(pkt);
+                    let packet = self.packet_from(pkt)?;
                     out.push(packet);
                 }
                 Err(EncoderStatus::Encoded) => continue,
@@ -115,11 +122,20 @@ impl Encoder for Av1Encoder {
                 frame.width, frame.height, self.width, self.height
             )));
         }
-        let mut rav1e_frame = self.ctx.new_frame();
+        validate_plane(
+            "Y",
+            &frame.planes[0],
+            frame.strides[0],
+            frame.width as usize,
+            frame.height as usize,
+        )?;
         let (cw, ch) = (
             (frame.width as usize).div_ceil(2),
             (frame.height as usize).div_ceil(2),
         );
+        validate_plane("U", &frame.planes[1], frame.strides[1], cw, ch)?;
+        validate_plane("V", &frame.planes[2], frame.strides[2], cw, ch)?;
+        let mut rav1e_frame = self.ctx.new_frame();
         copy_plane(
             &mut rav1e_frame.planes[0],
             &frame.planes[0],
@@ -144,13 +160,29 @@ impl Encoder for Av1Encoder {
 
         self.pending.insert(self.next_frameno, frame.pts);
         self.next_frameno += 1;
-        self.ctx
-            .send_frame(rav1e_frame)
-            .map_err(|e| Error::Encode(format!("rav1e: {e:?}")))?;
+        let send_result = if self.force_keyframe {
+            self.ctx.send_frame((
+                rav1e_frame,
+                FrameParameters {
+                    frame_type_override: FrameTypeOverride::Key,
+                    ..Default::default()
+                },
+            ))
+        } else {
+            self.ctx.send_frame(rav1e_frame)
+        };
+        send_result.map_err(|e| Error::Encode(format!("rav1e: {e:?}")))?;
 
         let mut out = Vec::new();
         self.drain(&mut out)?;
         Ok(out)
+    }
+
+    fn encode_keyframe(&mut self, frame: &Frame) -> Result<Vec<Packet>, Error> {
+        self.force_keyframe = true;
+        let result = self.encode(frame);
+        self.force_keyframe = false;
+        result
     }
 
     fn flush(&mut self) -> Result<Vec<Packet>, Error> {
@@ -159,7 +191,7 @@ impl Encoder for Av1Encoder {
         loop {
             match self.ctx.receive_packet() {
                 Ok(pkt) => {
-                    let packet = self.packet_from(pkt);
+                    let packet = self.packet_from(pkt)?;
                     out.push(packet);
                 }
                 Err(EncoderStatus::Encoded) => continue,
@@ -167,8 +199,43 @@ impl Encoder for Av1Encoder {
                 Err(e) => return Err(Error::Encode(format!("rav1e: {e:?}"))),
             }
         }
+        if !self.pending.is_empty() {
+            return Err(Error::Encode(format!(
+                "rav1e flush left {} frame timestamp(s) pending",
+                self.pending.len()
+            )));
+        }
         Ok(out)
     }
+}
+
+fn validate_plane(
+    name: &str,
+    data: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+) -> Result<(), Error> {
+    if stride < width {
+        return Err(Error::Encode(format!(
+            "{name} plane stride {stride} is smaller than width {width}"
+        )));
+    }
+    let required = if height == 0 {
+        0
+    } else {
+        (height - 1)
+            .checked_mul(stride)
+            .and_then(|offset| offset.checked_add(width))
+            .ok_or_else(|| Error::Encode(format!("{name} plane layout overflows usize")))?
+    };
+    if data.len() < required {
+        return Err(Error::Encode(format!(
+            "{name} plane has {} bytes; {required} required for {width}x{height} at stride {stride}",
+            data.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Copies one plane's valid `width`x`height` samples, row by row, from our
@@ -198,6 +265,7 @@ mod tests {
             height,
             planes: [y, u, v],
             strides: [w, cw, cw],
+            concealed_macroblocks: 0,
         }
     }
 
@@ -214,10 +282,46 @@ mod tests {
     }
 
     #[test]
+    fn requested_keyframe_is_exposed_on_the_output_packet() {
+        let mut enc = Av1Encoder::new(TrackId(0), 16, 16, 25, 60_000).unwrap();
+        let first = synthetic_frame(16, 16, Duration::ZERO, 10);
+        let forced = synthetic_frame(16, 16, Duration::from_millis(40), 20);
+        let mut packets = enc.encode(&first).unwrap();
+        packets.extend(enc.encode_keyframe(&forced).unwrap());
+        packets.extend(enc.flush().unwrap());
+
+        let packet = packets
+            .iter()
+            .find(|packet| packet.pts == forced.pts)
+            .expect("forced frame packet");
+        assert!(packet.keyframe);
+    }
+
+    #[test]
     fn mismatched_frame_size_is_rejected() {
         let mut enc = Av1Encoder::new(TrackId(0), 16, 16, 25, 60_000).unwrap();
         let frame = synthetic_frame(32, 32, Duration::ZERO, 0);
         assert!(enc.encode(&frame).is_err());
+    }
+
+    #[test]
+    fn undersized_plane_stride_is_rejected() {
+        let mut enc = Av1Encoder::new(TrackId(0), 16, 16, 25, 60_000).unwrap();
+        let mut frame = synthetic_frame(16, 16, Duration::ZERO, 0);
+        frame.strides[0] = 15;
+        let error = enc.encode(&frame).unwrap_err();
+        assert!(error.to_string().contains("Y plane stride 15"));
+    }
+
+    #[test]
+    fn truncated_plane_is_rejected() {
+        let mut enc = Av1Encoder::new(TrackId(0), 16, 16, 25, 60_000).unwrap();
+        let mut frame = synthetic_frame(16, 16, Duration::ZERO, 0);
+        frame.planes[1].pop();
+        let error = enc.encode(&frame).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("U plane has 63 bytes; 64 required"));
     }
 
     #[test]
@@ -241,5 +345,53 @@ mod tests {
         let mut expected = sent;
         expected.sort();
         assert_eq!(seen, expected);
+        assert!(enc.pending.is_empty());
+    }
+
+    #[test]
+    fn odd_width_encodes_and_flushes() {
+        let mut enc = Av1Encoder::new(TrackId(0), 17, 16, 25, 60_000).unwrap();
+        let frame = synthetic_frame(17, 16, Duration::from_millis(40), 42);
+        enc.encode(&frame).unwrap();
+        let packets = enc.flush().unwrap();
+        assert!(!packets.is_empty());
+        assert_eq!(packets[0].pts, Duration::from_millis(40));
+    }
+
+    #[test]
+    fn odd_height_encodes_and_flushes() {
+        let mut enc = Av1Encoder::new(TrackId(0), 16, 17, 25, 60_000).unwrap();
+        let frame = synthetic_frame(16, 17, Duration::from_millis(40), 42);
+        enc.encode(&frame).unwrap();
+        let packets = enc.flush().unwrap();
+        assert!(!packets.is_empty());
+        assert_eq!(packets[0].pts, Duration::from_millis(40));
+    }
+
+    #[test]
+    fn realistic_resolution_encodes_without_panic() {
+        let mut enc = Av1Encoder::new(TrackId(0), 640, 360, 25, 60_000).unwrap();
+        let frame = synthetic_frame(640, 360, Duration::from_millis(40), 7);
+        enc.encode(&frame).unwrap();
+        let packets = enc.flush().unwrap();
+        assert!(!packets.is_empty());
+        assert_eq!(packets[0].pts, Duration::from_millis(40));
+    }
+
+    #[test]
+    fn packet_for_unknown_frame_number_is_rejected() {
+        let mut enc = Av1Encoder::new(TrackId(0), 16, 16, 25, 60_000).unwrap();
+        let packet = rav1e::prelude::Packet {
+            data: vec![1, 2, 3],
+            rec: None,
+            source: None,
+            input_frameno: 99,
+            frame_type: FrameType::INTER,
+            qp: 100,
+            enc_stats: Default::default(),
+            opaque: None,
+        };
+        let error = enc.packet_from(packet).unwrap_err();
+        assert!(error.to_string().contains("unknown input frame 99"));
     }
 }

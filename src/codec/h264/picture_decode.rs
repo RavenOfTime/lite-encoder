@@ -168,7 +168,7 @@ impl PictureDecoder {
         // whatever samples a recycled buffer held, and the filter already
         // skips them so greying first is order-independent for correctness
         // but keeps a damaged picture's holes from looking like old video.
-        self.picture.grey_uncovered(&self.state.neighbours);
+        let concealed_macroblocks = self.picture.grey_uncovered(&self.state.neighbours);
         loopfilter::filter_picture(
             &mut self.picture,
             &self.state,
@@ -177,7 +177,7 @@ impl PictureDecoder {
                 chroma_qp_offset: self.params.chroma_qp_offset,
             },
         );
-        let frame = self.picture.to_frame(crop, pts);
+        let frame = self.picture.to_frame(crop, pts, concealed_macroblocks);
         let recycled = match marking {
             RefMarking::None => vec![self.picture],
             marking => self.dpb.mark_reference(self.picture, marking)?,
@@ -728,6 +728,31 @@ mod tests {
             max_frame_num: 16,
             crop: Cropping::default(),
         }
+    }
+
+    #[test]
+    fn finish_reports_concealed_macroblock_count() {
+        let config = PictureConfig {
+            width_mbs: 2,
+            height_mbs: 2,
+            max_refs: 1,
+            max_frame_num: 16,
+            crop: Cropping::default(),
+        };
+        let mut decoder = PictureDecoder::new(config);
+        decoder.state.begin_macroblock(0, 0);
+        decoder.state.begin_macroblock(3, 0);
+
+        let finished = decoder
+            .finish(
+                Cropping::default(),
+                Duration::from_millis(40),
+                &RefMarking::SlidingWindow,
+            )
+            .expect("finish");
+
+        assert_eq!(finished.frame.concealed_macroblocks, 2);
+        assert_eq!(finished.frame.pts, Duration::from_millis(40));
     }
 
     #[test]

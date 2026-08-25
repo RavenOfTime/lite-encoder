@@ -3,6 +3,8 @@
 //! Deliberately small. We support few formats on purpose, so these types
 //! describe what we actually carry rather than a universal media model.
 
+pub mod time;
+
 use std::time::Duration;
 
 /// Codecs we can carry. Narrow by design.
@@ -84,8 +86,10 @@ pub struct Track {
 
 /// One compressed access unit.
 ///
-/// `pts` is normalised to a monotonic timeline that starts at zero for the
-/// job, *not* the camera's clock. See `source::Timeline` for why that matters.
+/// `pts` is on the job timeline in nanoseconds, normalised by
+/// [`crate::source::Timeline`] at ingest. See [`time`] for how it maps into
+/// WebM. Encoders must copy the originating frame's PTS onto every packet they
+/// emit for that frame.
 #[derive(Debug, Clone)]
 pub struct Packet {
     pub track: TrackId,
@@ -95,6 +99,9 @@ pub struct Packet {
 }
 
 /// A decoded picture. Only what the encoders we target actually consume.
+///
+/// `pts` is copied from the compressed packet that produced this picture and
+/// must be passed unchanged to the encoder. See [`time`].
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub pts: Duration,
@@ -103,6 +110,10 @@ pub struct Frame {
     /// Planar YUV 4:2:0, 8-bit: Y, U, V.
     pub planes: [Vec<u8>; 3],
     pub strides: [usize; 3],
+    /// Macroblocks no slice claimed before concealment. Zero for a clean
+    /// picture; non-zero means mid-grey was painted into holes (packet loss,
+    /// incomplete slice coverage, etc.).
+    pub concealed_macroblocks: u32,
 }
 
 /// Decode compressed packets to frames.
@@ -123,5 +134,13 @@ pub trait Encoder: Send {
     /// Codec-private data for the muxer's track header.
     fn extra_data(&self) -> Vec<u8>;
     fn encode(&mut self, frame: &Frame) -> Result<Vec<Packet>, crate::Error>;
+    /// Encode this frame as a random-access point. Segment rollover uses this
+    /// so the next WebM cluster and segment can begin independently playable.
+    fn encode_keyframe(&mut self, frame: &Frame) -> Result<Vec<Packet>, crate::Error> {
+        let _ = frame;
+        Err(crate::Error::Encode(
+            "this encoder cannot force keyframes".into(),
+        ))
+    }
     fn flush(&mut self) -> Result<Vec<Packet>, crate::Error>;
 }

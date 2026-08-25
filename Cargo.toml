@@ -45,6 +45,14 @@ name = "bench_rav1e"
 required-features = ["av1"]
 
 [[example]]
+name = "bench_av1"
+required-features = ["av1"]
+
+[[test]]
+name = "transcode_pts"
+required-features = ["av1"]
+
+[[example]]
 name = "gen_h264_multislice_fixture"
 required-features = ["reference-decoder"]
 

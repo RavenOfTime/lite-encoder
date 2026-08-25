@@ -7,18 +7,11 @@
 //! last complete cluster.
 
 use super::ebml::{self, id};
+use crate::media::time::{self, webm_block_offset, webm_ticks, MAX_CLUSTER_SPAN};
 use crate::media::{Codec, Track, TrackKind};
 use crate::Error;
 use std::io::Write;
 use std::time::Duration;
-
-/// Matroska timestamps are in units of `TimestampScale` nanoseconds.
-/// 1 ms is the conventional choice and keeps cluster-relative offsets inside
-/// the signed 16-bit SimpleBlock field.
-const TIMESTAMP_SCALE_NS: u64 = 1_000_000;
-
-/// Clusters must stay well inside the +/-32767 tick SimpleBlock range.
-const MAX_CLUSTER_DURATION: Duration = Duration::from_secs(5);
 
 pub struct WebmMuxer<W: Write> {
     out: W,
@@ -75,7 +68,7 @@ impl<W: Write> WebmMuxer<W> {
 
     fn write_info(out: &mut Vec<u8>) {
         let mut b = Vec::new();
-        ebml::write_uint(&mut b, id::TIMESTAMP_SCALE, TIMESTAMP_SCALE_NS);
+        ebml::write_uint(&mut b, id::TIMESTAMP_SCALE, time::WEBM_TIMESTAMP_SCALE_NS);
         ebml::write_string(&mut b, id::MUXING_APP, "lite-encoder");
         ebml::write_string(&mut b, id::WRITING_APP, "lite-encoder");
         // Duration is deliberately omitted: it is unknown while recording,
@@ -157,7 +150,7 @@ impl<W: Write> WebmMuxer<W> {
                 pkt.pts
             }
             Some(base) => {
-                let long = pkt.pts.saturating_sub(base) >= MAX_CLUSTER_DURATION;
+                let long = pkt.pts.saturating_sub(base) >= MAX_CLUSTER_SPAN;
                 if (is_video && pkt.keyframe) || long {
                     self.flush_cluster()?;
                     self.cluster_base = Some(pkt.pts);
@@ -168,14 +161,7 @@ impl<W: Write> WebmMuxer<W> {
             }
         };
 
-        // Guard the i16 field rather than letting offsets silently wrap.
-        let rel_ms = (pkt.pts.as_millis() as i128) - (base.as_millis() as i128);
-        let rel_ms = i16::try_from(rel_ms).map_err(|_| {
-            Error::Mux(format!(
-                "packet {:?} too far from cluster base {base:?}",
-                pkt.pts
-            ))
-        })?;
+        let rel_ms = webm_block_offset(pkt.pts, base)?;
 
         ebml::write_simple_block(
             &mut self.cluster,
@@ -197,7 +183,7 @@ impl<W: Write> WebmMuxer<W> {
         }
 
         let mut body = Vec::with_capacity(self.cluster.len() + 16);
-        ebml::write_uint(&mut body, id::TIMESTAMP, base.as_millis() as u64);
+        ebml::write_uint(&mut body, id::TIMESTAMP, webm_ticks(base));
         body.extend_from_slice(&self.cluster);
 
         let mut framed = Vec::with_capacity(body.len() + 16);

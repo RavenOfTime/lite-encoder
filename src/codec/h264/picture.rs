@@ -65,14 +65,17 @@ impl Picture {
     ///
     /// Call after the picture's slices have been decoded and before the frame
     /// is displayed or entered into the DPB. A fully covered picture is a
-    /// no-op beyond walking the availability map.
-    pub fn grey_uncovered(&mut self, neighbourhood: &Neighbourhood) {
+    /// no-op beyond walking the availability map. Returns how many macroblocks
+    /// were painted.
+    pub fn grey_uncovered(&mut self, neighbourhood: &Neighbourhood) -> u32 {
         debug_assert_eq!(neighbourhood.width_mbs() * 16, self.width);
         debug_assert_eq!(neighbourhood.height_mbs() * 16, self.height);
+        let mut concealed = 0u32;
         for addr in 0..neighbourhood.len() {
             if neighbourhood.slice_of(addr).is_some() {
                 continue;
             }
+            concealed += 1;
             let (x, y) = neighbourhood.origin(addr);
             for row in 0..16 {
                 let start = (y + row) * self.strides[0] + x;
@@ -86,6 +89,7 @@ impl Picture {
                 }
             }
         }
+        concealed
     }
 
     /// An all-grey picture of `width_mbs` by `height_mbs` macroblocks.
@@ -129,7 +133,7 @@ impl Picture {
     }
 
     /// Copies out the display rectangle as a [`Frame`].
-    pub fn to_frame(&self, crop: Cropping, pts: Duration) -> Frame {
+    pub fn to_frame(&self, crop: Cropping, pts: Duration, concealed_macroblocks: u32) -> Frame {
         let (width, height) = crop.display_size(self.width, self.height);
         let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
         Frame {
@@ -142,6 +146,7 @@ impl Picture {
                 self.crop_plane(2, crop.left / 2, crop.top / 2, cw, ch),
             ],
             strides: [width, cw, cw],
+            concealed_macroblocks,
         }
     }
 
@@ -523,7 +528,7 @@ mod tests {
         let mut neighbourhood = Neighbourhood::new(2, 2);
         neighbourhood.begin_macroblock(0, 0);
         neighbourhood.begin_macroblock(3, 0);
-        p.grey_uncovered(&neighbourhood);
+        assert_eq!(p.grey_uncovered(&neighbourhood), 2);
 
         // Macroblock 0 at (0,0): claimed, still 40.
         assert_eq!(p.planes[0][0], 40);
@@ -563,7 +568,7 @@ mod tests {
         // than just the resulting size.
         p.planes[0][6 * 32 + 4] = 200;
         let crop = Cropping::from_sps_offsets(2, 0, 3, 0);
-        let frame = p.to_frame(crop, Duration::ZERO);
+        let frame = p.to_frame(crop, Duration::ZERO, 0);
 
         assert_eq!((frame.width, frame.height), (28, 26));
         assert_eq!(frame.planes[0].len(), 28 * 26);
@@ -575,7 +580,7 @@ mod tests {
     #[test]
     fn an_uncropped_picture_comes_out_whole() {
         let p = Picture::new(2, 2);
-        let frame = p.to_frame(Cropping::default(), Duration::from_millis(40));
+        let frame = p.to_frame(Cropping::default(), Duration::from_millis(40), 0);
         assert_eq!((frame.width, frame.height), (32, 32));
         assert_eq!(frame.planes[0].len(), 32 * 32);
         assert_eq!(frame.pts, Duration::from_millis(40));

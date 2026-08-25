@@ -84,6 +84,7 @@ fn to_frame(yuv: &impl YUVSource, pts: Duration) -> Frame {
             pack(yuv.v(), v_stride, width.div_ceil(2), height.div_ceil(2)),
         ],
         strides: [width, width.div_ceil(2), width.div_ceil(2)],
+        concealed_macroblocks: 0,
     }
 }
 

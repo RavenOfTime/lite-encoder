@@ -47,6 +47,10 @@ fn camera_fixture_decodes_exactly_four_1080p_pictures() {
             (EXPECTED_WIDTH, EXPECTED_HEIGHT),
             "picture {i} display size"
         );
+        assert_eq!(
+            frame.concealed_macroblocks, 0,
+            "picture {i} should be fully covered by slices"
+        );
     }
 }
 

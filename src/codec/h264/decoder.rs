@@ -353,4 +353,29 @@ mod tests {
         });
         assert!(validate_pps(&pps).unwrap_err().to_string().contains("FMO"));
     }
+
+    #[test]
+    fn cavlc_slice_is_rejected_without_reference_decoder() {
+        let (sps, mut pps) = camera_parameter_sets();
+        pps.entropy_coding_mode_flag = false;
+
+        let mut context = Context::default();
+        context.put_seq_param_set(sps);
+        context.put_pic_param_set(pps);
+
+        // The fixture's first VCL NAL is an I slice. Its slice-header grammar
+        // is unchanged by entropy_coding_mode_flag, so pairing it with the
+        // modified PPS provides a checked-in CAVLC header without requiring
+        // the OpenH264 encoder or entering macroblock decoding.
+        let slice = annexb::nal_units(CAMERA_FIXTURE)
+            .find(|nal| {
+                nal.first()
+                    .is_some_and(|header| matches!(header & 0x1f, 1 | 5))
+            })
+            .expect("fixture VCL slice missing");
+        let error = slice::parse_cabac(&context, slice).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("CAVLC slice; CABAC decoder required"));
+    }
 }
