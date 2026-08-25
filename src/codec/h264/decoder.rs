@@ -14,15 +14,30 @@ use crate::Error;
 use std::time::Duration;
 
 use super::annexb;
-use super::picture::Dpb;
+use super::picture::{Dpb, Picture};
 use super::picture_decode::PictureDecoder;
-use super::slice::{self, CabacSlice};
+use super::slice::{self, CabacSlice, PictureConfig};
+use super::state::PictureState;
 
 /// Persistent parsing state for one H.264 elementary stream.
+///
+/// It also owns the decoder's working buffers between pictures. Those are
+/// large — a 1080p picture is about 3 MB and the macroblock state another
+/// 1.5 MB — and allocating them per picture means faulting in fresh pages
+/// every frame, which measured as more of the decode time than reconstruction
+/// and deblocking combined. They live here because this is the only object
+/// that outlives a picture.
 #[derive(Debug, Default)]
 pub struct Frontend {
     context: Context,
     dpb: Option<Dpb>,
+    /// Picture buffers no longer referenced, ready to decode into again.
+    spare: Vec<Picture>,
+    state: Option<PictureState>,
+    /// The configuration `spare`, `state` and `dpb` were sized for. A new
+    /// coded video sequence can change the picture size, and buffers from the
+    /// old one are then the wrong shape rather than merely stale.
+    config: Option<PictureConfig>,
 }
 
 impl Frontend {
@@ -72,17 +87,36 @@ impl Frontend {
                 "access unit mixes picture configurations".into(),
             ));
         }
+        if self.config != Some(config) {
+            self.spare.clear();
+            self.state = None;
+            self.dpb = None;
+            self.config = Some(config);
+        }
         let dpb = self
             .dpb
             .take()
             .unwrap_or_else(|| Dpb::new(config.max_refs, config.max_frame_num));
-        let mut picture = PictureDecoder::with_dpb(config, dpb);
+        let mut buffer = self
+            .spare
+            .pop()
+            .unwrap_or_else(|| Picture::new(config.width_mbs, config.height_mbs));
+        buffer.reset();
+        let mut state = self
+            .state
+            .take()
+            .unwrap_or_else(|| PictureState::new(config.width_mbs, config.height_mbs));
+        state.begin_picture();
+
+        let mut picture = PictureDecoder::with_resources(config, dpb, buffer, state);
         for (slice_id, slice) in slices.iter().enumerate() {
             picture.decode_slice(slice, slice_id as u32)?;
         }
-        let (decoded, dpb) = picture.finish();
-        self.dpb = Some(dpb);
-        Ok(vec![decoded.to_frame(config.crop, pts)])
+        let finished = picture.finish(config.crop, pts);
+        self.dpb = Some(finished.dpb);
+        self.state = Some(finished.state);
+        self.spare.extend(finished.recycled);
+        Ok(vec![finished.frame])
     }
 
     fn put_sps(&mut self, nal: &RefNal<'_>) -> Result<(), Error> {

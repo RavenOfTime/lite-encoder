@@ -33,14 +33,30 @@ use super::state::{MbInfo, PictureState};
 use super::transform;
 use crate::Error;
 
+/// One scaling list as the SPS/PPS syntax delivers it, before fallback rules
+/// and before the scan→raster remap that dequant needs.
+///
+/// `h264-reader` hands us this shape; reconstruction never sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalingListSyntax<const N: usize> {
+    /// `scaling_list_present_flag` was 0: fall back per 7.4.2.1.1.1.
+    NotPresent,
+    /// Present but `use_default_scaling_matrix_flag`: Table 7-3 / 7-4.
+    UseDefault,
+    /// Present with explicit values, in the bitstream's scanning order.
+    Scan([u8; N]),
+}
+
 /// The dequantisation weights in force, from the sequence and picture
 /// parameter sets.
 ///
 /// Six 4x4 lists and two 8x8 ones, indexed as the spec indexes them: intra
-/// then inter, luma then Cb then Cr. Cameras almost always send flat lists,
-/// but a non-flat list changes every coefficient in the picture, so it cannot
-/// be assumed away.
-#[derive(Debug, Clone)]
+/// then inter, luma then Cb then Cr. Values are in *raster* order — the form
+/// [`transform::dequant_4x4`] indexes — remapped from the bitstream's scan
+/// order via the zig-zag tables. Cameras almost always send flat lists, but a
+/// non-flat list changes every coefficient in the picture, so it cannot be
+/// assumed away.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScalingLists {
     pub weight_4x4: [[u8; 16]; 6],
     /// Luma only: 4:2:0 High profile defines just the intra and inter luma
@@ -58,6 +74,107 @@ impl Default for ScalingLists {
 }
 
 impl ScalingLists {
+    /// Spec Tables 7-3 and 7-4, already remapped to raster WeightScale form.
+    ///
+    /// Used as the NotPresent fallback when resolving a matrix that has no
+    /// earlier SPS matrix to inherit from — not as the no-matrix-at-all case,
+    /// which is flat.
+    pub fn default_matrices() -> Self {
+        Self {
+            weight_4x4: [
+                scan_to_raster_4x4(&transform::DEFAULT_SCALING_LIST_4X4_INTRA),
+                scan_to_raster_4x4(&transform::DEFAULT_SCALING_LIST_4X4_INTRA),
+                scan_to_raster_4x4(&transform::DEFAULT_SCALING_LIST_4X4_INTRA),
+                scan_to_raster_4x4(&transform::DEFAULT_SCALING_LIST_4X4_INTER),
+                scan_to_raster_4x4(&transform::DEFAULT_SCALING_LIST_4X4_INTER),
+                scan_to_raster_4x4(&transform::DEFAULT_SCALING_LIST_4X4_INTER),
+            ],
+            weight_8x8: [
+                scan_to_raster_8x8(&transform::DEFAULT_SCALING_LIST_8X8_INTRA),
+                scan_to_raster_8x8(&transform::DEFAULT_SCALING_LIST_8X8_INTER),
+            ],
+        }
+    }
+
+    /// Applies the 7.4.2.1.1.1 fallback rules to one scaling matrix.
+    ///
+    /// `fallback` supplies the lists used when a slot is [`ScalingListSyntax::NotPresent`]
+    /// and that slot is the first of its intra/inter group (indices 0 and 3 for
+    /// 4x4, 0 and 1 for 8x8). When resolving an SPS matrix that is Default
+    /// tables; when resolving a PPS matrix that is the already-resolved SPS
+    /// lists, or the Default tables if the SPS carried none.
+    pub fn resolve(
+        lists_4x4: &[ScalingListSyntax<16>; 6],
+        lists_8x8: &[ScalingListSyntax<64>; 2],
+        fallback: &Self,
+    ) -> Self {
+        let mut weight_4x4 = [[0u8; 16]; 6];
+        for i in 0..6 {
+            weight_4x4[i] = match lists_4x4[i] {
+                ScalingListSyntax::Scan(scan) => scan_to_raster_4x4(&scan),
+                ScalingListSyntax::UseDefault => {
+                    if i < 3 {
+                        scan_to_raster_4x4(&transform::DEFAULT_SCALING_LIST_4X4_INTRA)
+                    } else {
+                        scan_to_raster_4x4(&transform::DEFAULT_SCALING_LIST_4X4_INTER)
+                    }
+                }
+                ScalingListSyntax::NotPresent => {
+                    if i == 0 || i == 3 {
+                        fallback.weight_4x4[i]
+                    } else {
+                        weight_4x4[i - 1]
+                    }
+                }
+            };
+        }
+        let mut weight_8x8 = [[0u8; 64]; 2];
+        for i in 0..2 {
+            weight_8x8[i] = match lists_8x8[i] {
+                ScalingListSyntax::Scan(scan) => scan_to_raster_8x8(&scan),
+                ScalingListSyntax::UseDefault => {
+                    if i == 0 {
+                        scan_to_raster_8x8(&transform::DEFAULT_SCALING_LIST_8X8_INTRA)
+                    } else {
+                        scan_to_raster_8x8(&transform::DEFAULT_SCALING_LIST_8X8_INTER)
+                    }
+                }
+                ScalingListSyntax::NotPresent => fallback.weight_8x8[i],
+            };
+        }
+        Self {
+            weight_4x4,
+            weight_8x8,
+        }
+    }
+
+    /// Combines SPS and PPS scaling matrices into the lists reconstruction uses.
+    ///
+    /// No matrix in either set → flat. SPS only → resolve against the Default
+    /// tables. PPS present → resolve against the SPS result (or Default tables
+    /// when the SPS carried none), so a picture-level override inherits the
+    /// slots it leaves absent.
+    pub fn from_syntax(
+        sps: Option<(&[ScalingListSyntax<16>; 6], &[ScalingListSyntax<64>; 2])>,
+        pps: Option<(&[ScalingListSyntax<16>; 6], Option<&[ScalingListSyntax<64>; 2]>)>,
+    ) -> Self {
+        let defaults = Self::default_matrices();
+        let sps_lists = sps.map(|(a, b)| Self::resolve(a, b, &defaults));
+        match pps {
+            None => sps_lists.unwrap_or_default(),
+            Some((lists_4x4, lists_8x8)) => {
+                let fallback = sps_lists.unwrap_or(defaults);
+                let lists_8x8 = match lists_8x8 {
+                    Some(lists) => *lists,
+                    // PPS without 8x8 (no `transform_8x8_mode_flag`): keep the
+                    // fallback's 8x8 slots by pretending both were NotPresent.
+                    None => [ScalingListSyntax::NotPresent; 2],
+                };
+                Self::resolve(lists_4x4, &lists_8x8, &fallback)
+            }
+        }
+    }
+
     /// The 4x4 list for a plane, spec table 7-2 ordering.
     fn list_4x4(&self, intra: bool, plane: usize) -> &[u8; 16] {
         &self.weight_4x4[if intra { plane } else { 3 + plane }]
@@ -66,6 +183,24 @@ impl ScalingLists {
     fn list_8x8(&self, intra: bool) -> &[u8; 64] {
         &self.weight_8x8[usize::from(!intra)]
     }
+}
+
+/// Bitstream scanning order → raster WeightScale, via Table 8-13.
+fn scan_to_raster_4x4(scan: &[u8; 16]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (s, &v) in scan.iter().enumerate() {
+        out[ZIGZAG_4X4[s]] = v;
+    }
+    out
+}
+
+/// Bitstream scanning order → raster WeightScale, via Table 8-14.
+fn scan_to_raster_8x8(scan: &[u8; 64]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    for (s, &v) in scan.iter().enumerate() {
+        out[ZIGZAG_8X8[s]] = v;
+    }
+    out
 }
 
 /// Picture-wide parameters reconstruction needs.
@@ -458,7 +593,7 @@ fn gather_luma_neighbours<'buf>(
     top: &'buf mut [u8; 32],
     left: &'buf mut [u8; 16],
 ) -> Neighbours<'buf> {
-    let sample = |x: i32, y: i32| intra_sample(picture, state, addr, x, y, blk, params, 0);
+    let sample = |x: i32, y: i32| intra_sample(picture, state, addr, x, y, blk, params);
 
     // The top row, plus the top-right group when it exists. Supplying only
     // `size` samples tells the predictor to replicate the last one, which is
@@ -539,7 +674,6 @@ fn intra_sample(
     y: i32,
     blk: u8,
     params: &ReconParams,
-    plane: usize,
 ) -> Option<u8> {
     let at = state.neighbours.luma_location(addr, x, y)?;
     if at.mb == addr {
@@ -552,8 +686,8 @@ fn intra_sample(
     }
 
     let (mb_x, mb_y) = state.neighbours.origin(at.mb);
-    let stride = picture.strides[plane];
-    Some(picture.planes[plane][(mb_y + at.y) * stride + mb_x + at.x])
+    let stride = picture.strides[0];
+    Some(picture.planes[0][(mb_y + at.y) * stride + mb_x + at.x])
 }
 
 fn chroma_sample(
@@ -763,7 +897,7 @@ mod tests {
             *sample = (i % 251) as u8;
         }
         let mut dpb = Dpb::new(1, 16);
-        dpb.push(reference.clone());
+        let _ = dpb.push(reference.clone());
 
         let mut picture = Picture::new(2, 2);
         let mut state = PictureState::new(2, 2);
@@ -832,5 +966,101 @@ mod tests {
         scaling.weight_8x8[1][0] = 9;
         assert_eq!(scaling.list_8x8(true)[0], 16);
         assert_eq!(scaling.list_8x8(false)[0], 9);
+    }
+
+    /// No matrix in either parameter set must stay flat: that is what every
+    /// camera in the supported subset sends, and what the decoder used before
+    /// scaling lists were wired up.
+    #[test]
+    fn absent_matrices_resolve_to_flat_lists() {
+        let lists = ScalingLists::from_syntax(None, None);
+        assert_eq!(lists, ScalingLists::default());
+        assert!(lists
+            .weight_4x4
+            .iter()
+            .all(|list| list == &transform::FLAT_WEIGHT_SCALE_4X4));
+        assert!(lists
+            .weight_8x8
+            .iter()
+            .all(|list| list == &transform::FLAT_WEIGHT_SCALE_8X8));
+    }
+
+    /// Scan-order bitstream values are remapped through the zig-zag so
+    /// dequant, which indexes by raster position, sees WeightScale(i, j).
+    #[test]
+    fn explicit_lists_are_stored_in_raster_order() {
+        let mut scan = [0u8; 16];
+        for (i, slot) in scan.iter_mut().enumerate() {
+            *slot = (i + 1) as u8;
+        }
+        let lists_4x4 = [ScalingListSyntax::Scan(scan); 6];
+        let lists_8x8 = [ScalingListSyntax::NotPresent; 2];
+        let lists = ScalingLists::resolve(&lists_4x4, &lists_8x8, &ScalingLists::default_matrices());
+        // Scan index 2 lands at raster 4 (Table 8-13).
+        assert_eq!(lists.weight_4x4[0][4], 3);
+        assert_eq!(lists.weight_4x4[0][0], 1);
+    }
+
+    /// NotPresent slots inherit: first of each intra/inter group from the
+    /// fallback, later slots from the previous resolved list.
+    #[test]
+    fn not_present_slots_follow_the_fallback_chain() {
+        let mut fallback = ScalingLists::default();
+        fallback.weight_4x4[0][0] = 11;
+        fallback.weight_4x4[3][0] = 22;
+        let lists_4x4 = [ScalingListSyntax::NotPresent; 6];
+        let lists_8x8 = [ScalingListSyntax::NotPresent; 2];
+        let lists = ScalingLists::resolve(&lists_4x4, &lists_8x8, &fallback);
+        assert_eq!(lists.weight_4x4[0][0], 11);
+        assert_eq!(lists.weight_4x4[1][0], 11);
+        assert_eq!(lists.weight_4x4[2][0], 11);
+        assert_eq!(lists.weight_4x4[3][0], 22);
+        assert_eq!(lists.weight_4x4[4][0], 22);
+        assert_eq!(lists.weight_4x4[5][0], 22);
+    }
+
+    /// UseDefault always pulls Tables 7-3 / 7-4, never the SPS fallback.
+    #[test]
+    fn use_default_ignores_the_fallback_and_loads_table_7_3() {
+        let lists_4x4 = [
+            ScalingListSyntax::UseDefault,
+            ScalingListSyntax::NotPresent,
+            ScalingListSyntax::NotPresent,
+            ScalingListSyntax::UseDefault,
+            ScalingListSyntax::NotPresent,
+            ScalingListSyntax::NotPresent,
+        ];
+        let lists_8x8 = [ScalingListSyntax::UseDefault, ScalingListSyntax::UseDefault];
+        let lists = ScalingLists::resolve(
+            &lists_4x4,
+            &lists_8x8,
+            &ScalingLists::default(), // flat fallback must not leak in
+        );
+        let expected = ScalingLists::default_matrices();
+        assert_eq!(lists.weight_4x4[0], expected.weight_4x4[0]);
+        assert_eq!(lists.weight_4x4[1], expected.weight_4x4[0]); // chained
+        assert_eq!(lists.weight_4x4[3], expected.weight_4x4[3]);
+        assert_eq!(lists.weight_8x8[0], expected.weight_8x8[0]);
+        assert_eq!(lists.weight_8x8[1], expected.weight_8x8[1]);
+    }
+
+    /// A PPS matrix with absent 8x8 lists must keep the SPS 8x8 weights.
+    #[test]
+    fn pps_without_8x8_keeps_sps_8x8_lists() {
+        let mut scan = transform::DEFAULT_SCALING_LIST_8X8_INTRA;
+        scan[0] = 99;
+        let sps_4 = [ScalingListSyntax::NotPresent; 6];
+        let sps_8 = [ScalingListSyntax::Scan(scan), ScalingListSyntax::UseDefault];
+        let pps_4 = [ScalingListSyntax::UseDefault; 6];
+        let lists = ScalingLists::from_syntax(Some((&sps_4, &sps_8)), Some((&pps_4, None)));
+        assert_eq!(lists.weight_8x8[0][ZIGZAG_8X8[0]], 99);
+        assert_eq!(
+            lists.weight_8x8[1],
+            ScalingLists::default_matrices().weight_8x8[1]
+        );
+        assert_eq!(
+            lists.weight_4x4[0],
+            ScalingLists::default_matrices().weight_4x4[0]
+        );
     }
 }

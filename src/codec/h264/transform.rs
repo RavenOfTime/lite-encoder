@@ -39,6 +39,16 @@ const POS_CLASS_4X4: [usize; 16] = [
 /// SPS/PPS may override them, so the API takes the list rather than assuming.
 pub const FLAT_WEIGHT_SCALE_4X4: [u8; 16] = [16; 16];
 
+/// Spec Table 7-3 `Default_4x4_Intra`, in scanning order.
+pub const DEFAULT_SCALING_LIST_4X4_INTRA: [u8; 16] = [
+    6, 13, 20, 28, 13, 20, 28, 32, 20, 28, 32, 37, 28, 32, 37, 42,
+];
+
+/// Spec Table 7-3 `Default_4x4_Inter`, in scanning order.
+pub const DEFAULT_SCALING_LIST_4X4_INTER: [u8; 16] = [
+    10, 14, 20, 24, 14, 20, 24, 27, 20, 24, 27, 30, 24, 27, 30, 34,
+];
+
 /// `LevelScale4x4(m, i, j)`, spec equation 8-318.
 #[inline]
 fn level_scale_4x4(weight_scale: &[u8; 16], m: usize, pos: usize) -> i32 {
@@ -209,6 +219,20 @@ const NORM_ADJUST_8X8: [[i32; 6]; 6] = [
 
 /// Flat 8x8 weight scale, the counterpart to [`FLAT_WEIGHT_SCALE_4X4`].
 pub const FLAT_WEIGHT_SCALE_8X8: [u8; 64] = [16; 64];
+
+/// Spec Table 7-4 `Default_8x8_Intra`, in scanning order.
+pub const DEFAULT_SCALING_LIST_8X8_INTRA: [u8; 64] = [
+    6, 10, 13, 16, 18, 23, 25, 27, 10, 11, 16, 18, 23, 25, 27, 29, 13, 16, 18, 23, 25, 27, 29,
+    31, 16, 18, 23, 25, 27, 29, 31, 33, 18, 23, 25, 27, 29, 31, 33, 36, 23, 25, 27, 29, 31, 33,
+    36, 38, 25, 27, 29, 31, 33, 36, 38, 40, 27, 29, 31, 33, 36, 38, 40, 42,
+];
+
+/// Spec Table 7-4 `Default_8x8_Inter`, in scanning order.
+pub const DEFAULT_SCALING_LIST_8X8_INTER: [u8; 64] = [
+    9, 13, 15, 17, 19, 21, 22, 24, 13, 13, 17, 19, 21, 22, 24, 25, 15, 17, 19, 21, 22, 24, 25,
+    27, 17, 19, 21, 22, 24, 25, 27, 28, 19, 21, 22, 24, 25, 27, 28, 30, 21, 22, 24, 25, 27, 28,
+    30, 32, 22, 24, 25, 27, 28, 30, 32, 33, 24, 25, 27, 28, 30, 32, 33, 35,
+];
 
 /// The 8x8 position-class rule, spec equation 8-319.
 ///

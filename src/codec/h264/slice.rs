@@ -5,8 +5,9 @@
 //! decoder needs that cursor. `CountingBits` supplies it while still letting
 //! `h264-reader` own every slice-header grammar detail.
 
+use h264_reader::nal::pps::{PicParameterSet, PicScalingMatrix};
 use h264_reader::nal::slice::{NumRefIdxActive, SliceFamily, SliceHeader};
-use h264_reader::nal::sps::FrameMbsFlags;
+use h264_reader::nal::sps::{FrameMbsFlags, ScalingList, SeqParameterSet, SeqScalingMatrix};
 use h264_reader::nal::{NalHeader, UnitType};
 use h264_reader::rbsp::{self, BitRead, BitReaderError, Numeric, Primitive};
 use h264_reader::Context;
@@ -14,6 +15,7 @@ use h264_reader::Context;
 use crate::Error;
 
 use super::picture::Cropping;
+use super::recon::{ScalingListSyntax, ScalingLists};
 
 /// Header details consumed by the macroblock layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +84,12 @@ pub enum SliceKind {
 #[derive(Debug)]
 pub struct CabacSlice {
     pub info: SliceInfo,
+    /// Dequantisation weights resolved from this slice's SPS/PPS.
+    ///
+    /// Carried beside the header rather than inside [`SliceInfo`] so the
+    /// header stays `Copy` while still updating when a new PPS arrives with
+    /// the same picture size.
+    pub scaling: ScalingLists,
     /// RBSP bytes holding CABAC data. `bit_offset` identifies its first bit.
     pub data: Vec<u8>,
     pub bit_offset: u8,
@@ -198,9 +206,83 @@ pub fn parse_cabac(ctx: &Context, nal: &[u8]) -> Result<CabacSlice, Error> {
             deblocking,
             num_ref_idx_l0,
         },
+        scaling: scaling_lists(sps, pps),
         data: rbsp[cabac_start / 8..].to_vec(),
         bit_offset: (cabac_start % 8) as u8,
     })
+}
+
+/// Resolves SPS/PPS scaling matrices into the WeightScale tables reconstruction
+/// indexes. Flat when neither set carries a matrix — the camera case.
+fn scaling_lists(sps: &SeqParameterSet, pps: &PicParameterSet) -> ScalingLists {
+    let sps_syntax = sps
+        .chroma_info
+        .scaling_matrix
+        .as_ref()
+        .map(seq_scaling_syntax);
+    let pps_syntax = pps
+        .extension
+        .as_ref()
+        .and_then(|extra| extra.pic_scaling_matrix.as_ref())
+        .map(pic_scaling_syntax);
+    ScalingLists::from_syntax(
+        sps_syntax.as_ref().map(|(a, b)| (a, b)),
+        pps_syntax.as_ref().map(|(a, b)| (a, b.as_ref())),
+    )
+}
+
+fn seq_scaling_syntax(
+    matrix: &SeqScalingMatrix,
+) -> ([ScalingListSyntax<16>; 6], [ScalingListSyntax<64>; 2]) {
+    (
+        take_six_4x4(&matrix.scaling_list4x4),
+        take_two_8x8(&matrix.scaling_list8x8),
+    )
+}
+
+fn pic_scaling_syntax(
+    matrix: &PicScalingMatrix,
+) -> (
+    [ScalingListSyntax<16>; 6],
+    Option<[ScalingListSyntax<64>; 2]>,
+) {
+    (
+        take_six_4x4(&matrix.scaling_list4x4),
+        matrix
+            .scaling_list8x8
+            .as_ref()
+            .map(|lists| take_two_8x8(lists)),
+    )
+}
+
+fn take_six_4x4(lists: &[ScalingList<16>]) -> [ScalingListSyntax<16>; 6] {
+    let mut out = [ScalingListSyntax::NotPresent; 6];
+    for (dst, src) in out.iter_mut().zip(lists.iter()) {
+        *dst = convert_list(src);
+    }
+    out
+}
+
+fn take_two_8x8(lists: &[ScalingList<64>]) -> [ScalingListSyntax<64>; 2] {
+    let mut out = [ScalingListSyntax::NotPresent; 2];
+    for (dst, src) in out.iter_mut().zip(lists.iter()) {
+        *dst = convert_list(src);
+    }
+    out
+}
+
+fn convert_list<const N: usize>(list: &ScalingList<N>) -> ScalingListSyntax<N> {
+    match list {
+        ScalingList::NotPresent => ScalingListSyntax::NotPresent,
+        ScalingList::UseDefault => ScalingListSyntax::UseDefault,
+        ScalingList::List(values) => {
+            let mut scan = [0u8; N];
+            for (dst, src) in scan.iter_mut().zip(values.iter()) {
+                *dst = src.get();
+            }
+            ScalingListSyntax::Scan(scan)
+        }
+    }
 }
 
 /// Consumes the CABAC header-alignment bits from spec 7.3.4.

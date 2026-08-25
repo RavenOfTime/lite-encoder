@@ -18,6 +18,7 @@
 use std::time::Duration;
 
 use super::inter::Plane;
+use super::neighbour::Neighbourhood;
 use crate::media::Frame;
 
 /// A decoded picture, in 4:2:0 planar 8-bit.
@@ -39,6 +40,54 @@ pub struct Picture {
 }
 
 impl Picture {
+    /// Whether this picture is already the size a given stream needs.
+    ///
+    /// Recycled buffers are only interchangeable within one coded video
+    /// sequence; a new sequence can change the picture size, and a buffer of
+    /// the wrong size has to be let go rather than resized.
+    pub fn is_sized(&self, width_mbs: usize, height_mbs: usize) -> bool {
+        self.width == width_mbs * 16 && self.height == height_mbs * 16
+    }
+
+    /// Returns a recycled picture to a state ready for a new decode, keeping
+    /// its allocations.
+    ///
+    /// Does *not* wipe the planes: at 1080p that is three megabytes of stores
+    /// every frame, and a complete picture overwrites every sample anyway.
+    /// Uncovered macroblocks — from packet loss, for example — are painted
+    /// mid-grey afterwards by [`Self::grey_uncovered`], so a hole never shows
+    /// whatever reference frame last occupied this buffer.
+    pub fn reset(&mut self) {
+        self.frame_num = 0;
+    }
+
+    /// Paints mid-grey into every macroblock no slice claimed.
+    ///
+    /// Call after the picture's slices have been decoded and before the frame
+    /// is displayed or entered into the DPB. A fully covered picture is a
+    /// no-op beyond walking the availability map.
+    pub fn grey_uncovered(&mut self, neighbourhood: &Neighbourhood) {
+        debug_assert_eq!(neighbourhood.width_mbs() * 16, self.width);
+        debug_assert_eq!(neighbourhood.height_mbs() * 16, self.height);
+        for addr in 0..neighbourhood.len() {
+            if neighbourhood.slice_of(addr).is_some() {
+                continue;
+            }
+            let (x, y) = neighbourhood.origin(addr);
+            for row in 0..16 {
+                let start = (y + row) * self.strides[0] + x;
+                self.planes[0][start..start + 16].fill(128);
+            }
+            let (cx, cy) = (x / 2, y / 2);
+            for plane in 1..3 {
+                for row in 0..8 {
+                    let start = (cy + row) * self.strides[plane] + cx;
+                    self.planes[plane][start..start + 8].fill(128);
+                }
+            }
+        }
+    }
+
     /// An all-grey picture of `width_mbs` by `height_mbs` macroblocks.
     ///
     /// Mid-grey rather than black: a picture that is somehow displayed before
@@ -96,15 +145,20 @@ impl Picture {
         }
     }
 
+    /// Copies the display rectangle of one plane out, row by row.
+    ///
+    /// Written as whole-row `extend_from_slice` rather than as an iterator
+    /// over samples: the row form compiles to one `memcpy` per row, and at
+    /// 1080p the per-sample form was costing several milliseconds a frame —
+    /// more than reconstruction of the entire picture.
     fn crop_plane(&self, plane: usize, x: usize, y: usize, width: usize, height: usize) -> Vec<u8> {
         let stride = self.strides[plane];
-        (0..height)
-            .flat_map(|row| {
-                let start = (y + row) * stride + x;
-                &self.planes[plane][start..start + width]
-            })
-            .copied()
-            .collect()
+        let mut out = Vec::with_capacity(width * height);
+        for row in 0..height {
+            let start = (y + row) * stride + x;
+            out.extend_from_slice(&self.planes[plane][start..start + width]);
+        }
+        out
     }
 }
 
@@ -197,7 +251,12 @@ impl Dpb {
     /// `FrameNumWrap`, not by arrival, which matters because `frame_num`
     /// wraps: without accounting for the wrap, the picture immediately after
     /// one would look like the oldest in the buffer and be evicted first.
-    pub fn push(&mut self, picture: Picture) {
+    ///
+    /// The evicted picture is handed back rather than dropped. Its buffers are
+    /// exactly the size the next picture needs, and at 1080p re-allocating
+    /// them every frame costs more than all the deblocking in the picture.
+    #[must_use = "the evicted picture's buffers are worth reusing"]
+    pub fn push(&mut self, picture: Picture) -> Option<Picture> {
         let current = picture.frame_num;
         self.refs.insert(0, picture);
         if self.refs.len() > self.capacity {
@@ -209,9 +268,10 @@ impl Dpb {
                 .min_by_key(|(_, p)| frame_num_wrap(p.frame_num, current, max))
                 .map(|(i, _)| i);
             if let Some(oldest) = oldest {
-                self.refs.remove(oldest);
+                return Some(self.refs.remove(oldest));
             }
         }
+        None
     }
 }
 
@@ -244,6 +304,38 @@ mod tests {
         assert_eq!(p.planes[1].len(), 32 * 24);
         assert_eq!(p.strides, [64, 32, 32]);
         assert!(p.planes.iter().all(|plane| plane.iter().all(|&s| s == 128)));
+    }
+
+    /// A recycled buffer keeps its previous samples through [`Picture::reset`];
+    /// only the holes after an incomplete decode are painted grey.
+    #[test]
+    fn grey_uncovered_paints_only_unclaimed_macroblocks() {
+        let mut p = Picture::new(2, 2);
+        for plane in &mut p.planes {
+            plane.fill(40);
+        }
+        p.reset();
+        assert!(
+            p.planes.iter().all(|plane| plane.iter().all(|&s| s == 40)),
+            "reset must not wipe the planes"
+        );
+
+        let mut neighbourhood = Neighbourhood::new(2, 2);
+        neighbourhood.begin_macroblock(0, 0);
+        neighbourhood.begin_macroblock(3, 0);
+        p.grey_uncovered(&neighbourhood);
+
+        // Macroblock 0 at (0,0): claimed, still 40.
+        assert_eq!(p.planes[0][0], 40);
+        assert_eq!(p.planes[1][0], 40);
+        // Macroblock 1 at (16,0): hole, grey.
+        assert_eq!(p.planes[0][16], 128);
+        assert_eq!(p.planes[1][8], 128);
+        // Macroblock 2 at (0,16): hole, grey.
+        assert_eq!(p.planes[0][16 * 32], 128);
+        // Macroblock 3 at (16,16): claimed, still 40.
+        assert_eq!(p.planes[0][16 * 32 + 16], 40);
+        assert_eq!(p.planes[2][8 * 16 + 8], 40);
     }
 
     #[test]
@@ -289,11 +381,13 @@ mod tests {
         assert_eq!(frame.pts, Duration::from_millis(40));
     }
 
+    // The evicted picture these tests discard is the recycled buffer; only
+    // the live decode path has anything to do with it.
     #[test]
     fn the_most_recently_pushed_picture_is_reference_zero() {
         let mut dpb = Dpb::new(4, 16);
-        dpb.push(picture_numbered(1));
-        dpb.push(picture_numbered(2));
+        let _ = dpb.push(picture_numbered(1));
+        let _ = dpb.push(picture_numbered(2));
         assert_eq!(dpb.get(0).unwrap().frame_num, 2);
         assert_eq!(dpb.get(1).unwrap().frame_num, 1);
         assert_eq!(dpb.len(), 2);
@@ -303,7 +397,7 @@ mod tests {
     fn the_buffer_never_grows_past_its_capacity() {
         let mut dpb = Dpb::new(2, 16);
         for frame_num in 0..6 {
-            dpb.push(picture_numbered(frame_num));
+            let _ = dpb.push(picture_numbered(frame_num));
         }
         assert_eq!(dpb.len(), 2);
         assert_eq!(dpb.get(0).unwrap().frame_num, 5);
@@ -316,10 +410,10 @@ mod tests {
     #[test]
     fn eviction_survives_the_frame_number_wrapping() {
         let mut dpb = Dpb::new(2, 16);
-        dpb.push(picture_numbered(14));
-        dpb.push(picture_numbered(15));
+        let _ = dpb.push(picture_numbered(14));
+        let _ = dpb.push(picture_numbered(15));
         // The counter wraps back to zero, which is newer than both.
-        dpb.push(picture_numbered(0));
+        let _ = dpb.push(picture_numbered(0));
 
         assert_eq!(dpb.len(), 2);
         assert_eq!(dpb.get(0).unwrap().frame_num, 0);
@@ -330,7 +424,7 @@ mod tests {
     #[test]
     fn an_idr_empties_the_buffer() {
         let mut dpb = Dpb::new(4, 16);
-        dpb.push(picture_numbered(1));
+        let _ = dpb.push(picture_numbered(1));
         dpb.clear();
         assert!(dpb.is_empty());
         assert!(dpb.get(0).is_none());
@@ -341,7 +435,7 @@ mod tests {
     #[test]
     fn a_zero_capacity_buffer_still_holds_one_reference() {
         let mut dpb = Dpb::new(0, 16);
-        dpb.push(picture_numbered(1));
+        let _ = dpb.push(picture_numbered(1));
         assert_eq!(dpb.len(), 1);
     }
 

@@ -48,8 +48,10 @@ pub fn filter_picture(picture: &mut Picture, state: &PictureState, params: &Filt
 /// The deblocking control governing the macroblock at `addr`.
 ///
 /// `None` for a macroblock no slice ever claimed, which happens when a picture
-/// arrives with slices missing; leaving those samples untouched is better than
-/// filtering them against whatever the neighbour state defaulted to.
+/// arrives with slices missing. Those samples are painted mid-grey by
+/// [`super::picture::Picture::grey_uncovered`] before the filter runs; leaving
+/// them unfiltered is better than filtering them against a neighbour state
+/// that was never written for this picture.
 fn slice_control(
     state: &PictureState,
     params: &FilterParams<'_>,
@@ -70,12 +72,14 @@ fn filter_macroblock(
     let cur = state.get(addr);
     let (mb_x, mb_y) = (n.mb_x(addr), n.mb_y(addr));
 
-    // A macroblock edge is filtered only when the neighbour exists in the
-    // picture, and — when `disable_deblocking_filter_idc` is 2 — only when it
-    // belongs to this same slice.
+    // A macroblock edge is filtered only when the neighbour exists and was
+    // claimed by a slice — an unclaimed hole has no usable MbInfo — and,
+    // when `disable_deblocking_filter_idc` is 2, only when it belongs to this
+    // same slice.
     let across = |neighbour: Option<MbAddr>| -> Option<MbAddr> {
         let neighbour = neighbour?;
-        if control.crosses_slices() || n.slice_of(neighbour) == n.slice_of(addr) {
+        let ns = n.slice_of(neighbour)?;
+        if control.crosses_slices() || Some(ns) == n.slice_of(addr) {
             Some(neighbour)
         } else {
             None

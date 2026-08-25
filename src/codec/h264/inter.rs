@@ -16,12 +16,10 @@
 //! bilinear weights. This is where a real decoder spends most of its time, and
 //! in ffmpeg it is the single largest body of hand-written assembly.
 //!
-//! The implementation here is the straightforward per-sample form, which
-//! recomputes shared intermediates. That is deliberate for now: it matches the
-//! spec structure closely enough to audit line by line. Blocking it up so each
-//! six-tap intermediate is computed once, and then adding SIMD, is a change
-//! confined to this file and worth making only once real streams decode
-//! correctly.
+//! Filters run block-at-a-time: the source patch is gathered once, the
+//! fractional position is resolved once, and each arm loops over in-bounds
+//! patch samples. The spec's own per-sample wording is kept under
+//! `#[cfg(test)]` and the block paths are checked against it.
 
 /// A reference picture plane, with the bounds needed for edge clamping.
 #[derive(Debug, Clone, Copy)]
@@ -61,7 +59,12 @@ fn tap6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
 }
 
 /// Horizontal half-sample intermediate `b1`, spec 8-244.
-#[inline]
+///
+/// Written per sample, as the spec writes it. [`predict_luma`] does not call
+/// it — it filters a whole block at a time — so this and its two companions
+/// exist to state the definition plainly and to be what the optimised path is
+/// tested against.
+#[cfg(test)]
 fn half_h(p: &Plane, x: i32, y: i32) -> i32 {
     tap6(
         p.at(x - 2, y),
@@ -73,8 +76,8 @@ fn half_h(p: &Plane, x: i32, y: i32) -> i32 {
     )
 }
 
-/// Vertical half-sample intermediate `h1`, spec 8-245.
-#[inline]
+/// Vertical half-sample intermediate `h1`, spec 8-245. See [`half_h`].
+#[cfg(test)]
 fn half_v(p: &Plane, x: i32, y: i32) -> i32 {
     tap6(
         p.at(x, y - 2),
@@ -90,7 +93,7 @@ fn half_v(p: &Plane, x: i32, y: i32) -> i32 {
 ///
 /// Applies the six-tap filter vertically to horizontal intermediates. The spec
 /// notes the transpose gives the same value, which the tests check.
-#[inline]
+#[cfg(test)]
 fn centre(p: &Plane, x: i32, y: i32) -> i32 {
     tap6(
         half_h(p, x, y - 2),
@@ -114,14 +117,82 @@ fn round_centre(v: i32) -> i32 {
     clip1((v + 512) >> 10) as i32
 }
 
+/// The six-tap filter reaches two samples back and three forward, so a
+/// `bw` by `bh` block is predicted from a `bw + 5` by `bh + 5` patch.
+const MARGIN: usize = 5;
+
+/// The largest patch any luma partition needs: a 16x16 block plus the margin.
+const MAX_PATCH: usize = (16 + MARGIN) * (16 + MARGIN);
+
+/// The largest horizontal-intermediate buffer: one row per patch row, one
+/// column per output column.
+const MAX_ROWS: usize = (16 + MARGIN) * 16;
+
+/// Copies the source patch out of the reference, clamping to its edges.
+///
+/// Gathering once is the whole point of the block-at-a-time structure. Every
+/// fractional position reads overlapping taps, and the centre position reads
+/// thirty-six source samples for each sample it produces; done per output
+/// sample that is thirty-six clamped loads, and done per block it is one.
+fn gather(p: &Plane, x0: i32, y0: i32, pw: usize, ph: usize, out: &mut [u8]) {
+    // The common case by far: the patch lies wholly inside the reference, so
+    // no coordinate needs clamping and each row is one copy.
+    if x0 >= 0
+        && y0 >= 0
+        && (x0 as usize + pw) <= p.width
+        && (y0 as usize + ph) <= p.height
+    {
+        for j in 0..ph {
+            let start = (y0 as usize + j) * p.stride + x0 as usize;
+            out[j * pw..(j + 1) * pw].copy_from_slice(&p.data[start..start + pw]);
+        }
+        return;
+    }
+    for j in 0..ph {
+        let y = (y0 + j as i32).clamp(0, p.height as i32 - 1) as usize;
+        let row = y * p.stride;
+        for i in 0..pw {
+            let x = (x0 + i as i32).clamp(0, p.width as i32 - 1) as usize;
+            out[j * pw + i] = p.data[row + x];
+        }
+    }
+}
+
+/// Copies a block of full samples, for the integer-vector case.
+fn copy_block(p: &Plane, x0: i32, y0: i32, bw: usize, bh: usize, out: &mut [u8]) {
+    if x0 >= 0
+        && y0 >= 0
+        && (x0 as usize + bw) <= p.width
+        && (y0 as usize + bh) <= p.height
+    {
+        for j in 0..bh {
+            let start = (y0 as usize + j) * p.stride + x0 as usize;
+            out[j * bw..(j + 1) * bw].copy_from_slice(&p.data[start..start + bw]);
+        }
+        return;
+    }
+    for j in 0..bh {
+        for i in 0..bw {
+            out[j * bw + i] = p.at(x0 + i as i32, y0 + j as i32) as u8;
+        }
+    }
+}
+
 /// Predict one luma block from a reference plane. Spec 8.4.2.2.1.
 ///
 /// `x0`, `y0` are the block's position in the *current* picture, and `mv` is
 /// in quarter-sample units. `out` receives `bw * bh` samples with stride `bw`.
 ///
-/// The sixteen fractional positions are the spec's lettered grid: `(0,0)` is
-/// the full sample `G`, `(2,2)` is the centre `j`, and the rest are half
+/// The sixteen fractional positions are the spec's lettered grid: `(0, 0)` is
+/// the full sample `G`, `(2, 2)` is the centre `j`, and the rest are half
 /// positions or averages of two positions.
+///
+/// The fractional position is fixed for the whole block, so it is resolved
+/// once here rather than per sample, and each arm runs its own loop over
+/// source samples already gathered into a patch. The spec's own wording is
+/// per sample — `half_h`, `half_v` and `centre` say it that way, and the
+/// tests check this against them — but evaluating it that way re-reads and
+/// re-filters the same taps for every neighbouring output.
 pub fn predict_luma(
     reference: &Plane,
     x0: i32,
@@ -139,77 +210,125 @@ pub fn predict_luma(
     let xfrac = (mvx & 3) as usize;
     let yfrac = (mvy & 3) as usize;
 
-    for j in 0..bh {
-        for i in 0..bw {
-            let x = base_x + i as i32;
-            let y = base_y + j as i32;
+    if xfrac == 0 && yfrac == 0 {
+        copy_block(reference, base_x, base_y, bw, bh, out);
+        return;
+    }
 
-            let v = match (xfrac, yfrac) {
-                // Full sample.
-                (0, 0) => reference.at(x, y),
+    let (pw, ph) = (bw + MARGIN, bh + MARGIN);
+    let mut patch = [0u8; MAX_PATCH];
+    gather(reference, base_x - 2, base_y - 2, pw, ph, &mut patch[..pw * ph]);
 
-                // Pure horizontal.
-                (2, 0) => round_half(half_h(reference, x, y)),
-                (1, 0) => (reference.at(x, y) + round_half(half_h(reference, x, y)) + 1) >> 1,
-                (3, 0) => (reference.at(x + 1, y) + round_half(half_h(reference, x, y)) + 1) >> 1,
+    // Patch coordinates of output sample `(i, j)`: the margin puts the full
+    // sample `G` two rows down and two columns along.
+    let full = |i: usize, j: usize| patch[(j + 2) * pw + (i + 2)] as i32;
+    // Horizontal six-tap over patch row `r`, aligned to output column `i`.
+    let horizontal = |r: usize, i: usize| {
+        let b = r * pw + i;
+        tap6(
+            patch[b] as i32,
+            patch[b + 1] as i32,
+            patch[b + 2] as i32,
+            patch[b + 3] as i32,
+            patch[b + 4] as i32,
+            patch[b + 5] as i32,
+        )
+    };
+    // Vertical six-tap over patch column `c`, aligned to output row `j`.
+    let vertical = |j: usize, c: usize| {
+        tap6(
+            patch[j * pw + c] as i32,
+            patch[(j + 1) * pw + c] as i32,
+            patch[(j + 2) * pw + c] as i32,
+            patch[(j + 3) * pw + c] as i32,
+            patch[(j + 4) * pw + c] as i32,
+            patch[(j + 5) * pw + c] as i32,
+        )
+    };
 
-                // Pure vertical.
-                (0, 2) => round_half(half_v(reference, x, y)),
-                (0, 1) => (reference.at(x, y) + round_half(half_v(reference, x, y)) + 1) >> 1,
-                (0, 3) => (reference.at(x, y + 1) + round_half(half_v(reference, x, y)) + 1) >> 1,
-
-                // Centre, and the quarter positions adjacent to it.
-                (2, 2) => round_centre(centre(reference, x, y)),
-                (1, 2) => {
-                    let h = round_half(half_v(reference, x, y));
-                    let j_ = round_centre(centre(reference, x, y));
-                    (h + j_ + 1) >> 1
-                }
-                (3, 2) => {
-                    let m = round_half(half_v(reference, x + 1, y));
-                    let j_ = round_centre(centre(reference, x, y));
-                    (j_ + m + 1) >> 1
-                }
-                (2, 1) => {
-                    let b = round_half(half_h(reference, x, y));
-                    let j_ = round_centre(centre(reference, x, y));
-                    (b + j_ + 1) >> 1
-                }
-                (2, 3) => {
-                    let s = round_half(half_h(reference, x, y + 1));
-                    let j_ = round_centre(centre(reference, x, y));
-                    (j_ + s + 1) >> 1
-                }
-
-                // Diagonal quarter positions: average of the two adjacent
-                // half positions, never involving the centre.
-                (1, 1) => {
-                    let b = round_half(half_h(reference, x, y));
-                    let h = round_half(half_v(reference, x, y));
-                    (b + h + 1) >> 1
-                }
-                (3, 1) => {
-                    let b = round_half(half_h(reference, x, y));
-                    let m = round_half(half_v(reference, x + 1, y));
-                    (b + m + 1) >> 1
-                }
-                (1, 3) => {
-                    let h = round_half(half_v(reference, x, y));
-                    let s = round_half(half_h(reference, x, y + 1));
-                    (h + s + 1) >> 1
-                }
-                (3, 3) => {
-                    let m = round_half(half_v(reference, x + 1, y));
-                    let s = round_half(half_h(reference, x, y + 1));
-                    (m + s + 1) >> 1
-                }
-
-                _ => unreachable!("fractional position is masked to 0..=3"),
-            };
-            out[j * bw + i] = clip1(v);
+    // The centre position filters vertically over unrounded horizontal
+    // intermediates, so those are computed once for the whole patch and
+    // shared down each column instead of six times per output sample.
+    let needs_centre = matches!((xfrac, yfrac), (2, 1) | (2, 2) | (2, 3) | (1, 2) | (3, 2));
+    let mut rows = [0i32; MAX_ROWS];
+    if needs_centre {
+        for r in 0..ph {
+            for i in 0..bw {
+                rows[r * bw + i] = horizontal(r, i);
+            }
         }
     }
+    let centre_at = |rows: &[i32], i: usize, j: usize| {
+        tap6(
+            rows[j * bw + i],
+            rows[(j + 1) * bw + i],
+            rows[(j + 2) * bw + i],
+            rows[(j + 3) * bw + i],
+            rows[(j + 4) * bw + i],
+            rows[(j + 5) * bw + i],
+        )
+    };
+
+    // One loop per fractional position, so the sixteen-way decision is taken
+    // once for the block rather than once per sample.
+    macro_rules! fill {
+        ($value:expr) => {
+            for j in 0..bh {
+                for i in 0..bw {
+                    let f = $value;
+                    out[j * bw + i] = clip1(f(i, j));
+                }
+            }
+        };
+    }
+
+    match (xfrac, yfrac) {
+        (1, 0) => fill!(|i, j| (full(i, j) + round_half(horizontal(j + 2, i)) + 1) >> 1),
+        (2, 0) => fill!(|i, j| round_half(horizontal(j + 2, i))),
+        (3, 0) => fill!(|i, j| (full(i + 1, j) + round_half(horizontal(j + 2, i)) + 1) >> 1),
+
+        (0, 1) => fill!(|i, j| (full(i, j) + round_half(vertical(j, i + 2)) + 1) >> 1),
+        (0, 2) => fill!(|i, j| round_half(vertical(j, i + 2))),
+        (0, 3) => fill!(|i, j| (full(i, j + 1) + round_half(vertical(j, i + 2)) + 1) >> 1),
+
+        (2, 2) => fill!(|i, j| round_centre(centre_at(&rows, i, j))),
+        (1, 2) => fill!(|i, j| {
+            (round_half(vertical(j, i + 2)) + round_centre(centre_at(&rows, i, j)) + 1) >> 1
+        }),
+        (3, 2) => fill!(|i, j| {
+            (round_centre(centre_at(&rows, i, j)) + round_half(vertical(j, i + 3)) + 1) >> 1
+        }),
+        (2, 1) => fill!(|i, j| {
+            (round_half(horizontal(j + 2, i)) + round_centre(centre_at(&rows, i, j)) + 1) >> 1
+        }),
+        (2, 3) => fill!(|i, j| {
+            (round_centre(centre_at(&rows, i, j)) + round_half(horizontal(j + 3, i)) + 1) >> 1
+        }),
+
+        // Diagonal quarter positions: average of the two adjacent half
+        // positions, never involving the centre.
+        (1, 1) => {
+            fill!(|i, j| (round_half(horizontal(j + 2, i)) + round_half(vertical(j, i + 2)) + 1) >> 1)
+        }
+        (3, 1) => {
+            fill!(|i, j| (round_half(horizontal(j + 2, i)) + round_half(vertical(j, i + 3)) + 1) >> 1)
+        }
+        (1, 3) => {
+            fill!(|i, j| (round_half(vertical(j, i + 2)) + round_half(horizontal(j + 3, i)) + 1) >> 1)
+        }
+        (3, 3) => {
+            fill!(|i, j| (round_half(vertical(j, i + 3)) + round_half(horizontal(j + 3, i)) + 1) >> 1)
+        }
+
+        _ => unreachable!("the integer position returned early"),
+    }
 }
+
+/// The bilinear filter reads one sample past the block on each axis.
+const CHROMA_MARGIN: usize = 1;
+
+/// The largest patch any chroma partition needs: an 8x8 block plus the margin.
+const MAX_CHROMA_PATCH: usize = (8 + CHROMA_MARGIN) * (8 + CHROMA_MARGIN);
 
 /// Predict one chroma block for 4:2:0. Spec 8.4.2.2.2.
 ///
@@ -217,6 +336,11 @@ pub fn predict_luma(
 /// resolution in both axes, so the same vector addresses eighth-sample
 /// positions in the chroma plane, which is why no scaling appears here and the
 /// fractional mask is 7 rather than 3.
+///
+/// As with [`predict_luma`], the source patch is gathered once — here `bw + 1`
+/// by `bh + 1`, since bilinear only reaches one sample past the block — the
+/// weights are fixed for the whole block, and each output sample is four
+/// in-bounds patch reads rather than four clamped loads against the reference.
 pub fn predict_chroma(
     reference: &Plane,
     x0: i32,
@@ -227,29 +351,37 @@ pub fn predict_chroma(
     out: &mut [u8],
 ) {
     let (mvx, mvy) = mv;
+    // Arithmetic shift: motion vectors are signed and the spec floors toward
+    // negative infinity, same as the luma path.
     let base_x = x0 + (mvx >> 3);
     let base_y = y0 + (mvy >> 3);
     let xfrac = mvx & 7;
     let yfrac = mvy & 7;
 
+    if xfrac == 0 && yfrac == 0 {
+        copy_block(reference, base_x, base_y, bw, bh, out);
+        return;
+    }
+
+    let (pw, ph) = (bw + CHROMA_MARGIN, bh + CHROMA_MARGIN);
+    let mut patch = [0u8; MAX_CHROMA_PATCH];
+    gather(reference, base_x, base_y, pw, ph, &mut patch[..pw * ph]);
+
+    let w_a = (8 - xfrac) * (8 - yfrac);
+    let w_b = xfrac * (8 - yfrac);
+    let w_c = (8 - xfrac) * yfrac;
+    let w_d = xfrac * yfrac;
+
     for j in 0..bh {
         for i in 0..bw {
-            let x = base_x + i as i32;
-            let y = base_y + j as i32;
+            let a = patch[j * pw + i] as i32;
+            let b = patch[j * pw + i + 1] as i32;
+            let c = patch[(j + 1) * pw + i] as i32;
+            let d = patch[(j + 1) * pw + i + 1] as i32;
 
-            let a = reference.at(x, y);
-            let b = reference.at(x + 1, y);
-            let c = reference.at(x, y + 1);
-            let d = reference.at(x + 1, y + 1);
-
-            // Bilinear over eighths, spec 8-266.
-            let v = ((8 - xfrac) * (8 - yfrac) * a
-                + xfrac * (8 - yfrac) * b
-                + (8 - xfrac) * yfrac * c
-                + xfrac * yfrac * d
-                + 32)
-                >> 6;
-            out[j * bw + i] = clip1(v);
+            // Bilinear over eighths, spec 8-266. Weights sum to 64 and the
+            // inputs are samples, so the rounded result is already in 0..=255.
+            out[j * bw + i] = ((w_a * a + w_b * b + w_c * c + w_d * d + 32) >> 6) as u8;
         }
     }
 }
@@ -397,6 +529,167 @@ mod tests {
             width: w,
             height: h,
             stride: w,
+        }
+    }
+
+    /// The spec's own per-sample wording, transcribed straight from 8.4.2.2.1.
+    ///
+    /// Kept as a test fixture rather than as the implementation: it is the
+    /// definition [`predict_luma`] has to match, and it is obviously correct
+    /// in a way that a block-at-a-time filter with a gathered patch and shared
+    /// intermediates is not.
+    fn per_sample(p: &Plane, x: i32, y: i32, xfrac: usize, yfrac: usize) -> u8 {
+        let v = match (xfrac, yfrac) {
+            (0, 0) => p.at(x, y),
+
+            (2, 0) => round_half(half_h(p, x, y)),
+            (1, 0) => (p.at(x, y) + round_half(half_h(p, x, y)) + 1) >> 1,
+            (3, 0) => (p.at(x + 1, y) + round_half(half_h(p, x, y)) + 1) >> 1,
+
+            (0, 2) => round_half(half_v(p, x, y)),
+            (0, 1) => (p.at(x, y) + round_half(half_v(p, x, y)) + 1) >> 1,
+            (0, 3) => (p.at(x, y + 1) + round_half(half_v(p, x, y)) + 1) >> 1,
+
+            (2, 2) => round_centre(centre(p, x, y)),
+            (1, 2) => (round_half(half_v(p, x, y)) + round_centre(centre(p, x, y)) + 1) >> 1,
+            (3, 2) => (round_centre(centre(p, x, y)) + round_half(half_v(p, x + 1, y)) + 1) >> 1,
+            (2, 1) => (round_half(half_h(p, x, y)) + round_centre(centre(p, x, y)) + 1) >> 1,
+            (2, 3) => (round_centre(centre(p, x, y)) + round_half(half_h(p, x, y + 1)) + 1) >> 1,
+
+            (1, 1) => (round_half(half_h(p, x, y)) + round_half(half_v(p, x, y)) + 1) >> 1,
+            (3, 1) => (round_half(half_h(p, x, y)) + round_half(half_v(p, x + 1, y)) + 1) >> 1,
+            (1, 3) => (round_half(half_v(p, x, y)) + round_half(half_h(p, x, y + 1)) + 1) >> 1,
+            (3, 3) => (round_half(half_v(p, x + 1, y)) + round_half(half_h(p, x, y + 1)) + 1) >> 1,
+
+            _ => unreachable!(),
+        };
+        clip1(v)
+    }
+
+    /// The block filter must agree with that definition sample for sample, at
+    /// every fractional position and every partition shape.
+    ///
+    /// Noise, not a gradient: a smooth reference makes wrong tap weights and
+    /// transposed positions produce nearly the right answer, which is exactly
+    /// the class of bug this guards. Several of the positions deliberately
+    /// hang off the edge of the reference, where the gathered patch has to
+    /// reproduce the spec's edge clamping.
+    #[test]
+    fn block_interpolation_matches_the_per_sample_definition() {
+        let (w, h) = (48usize, 40usize);
+        let mut data = vec![0u8; w * h];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for v in &mut data {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *v = (seed >> 33) as u8;
+        }
+        let p = plane(&data, w, h);
+
+        for (bw, bh) in [(16, 16), (16, 8), (8, 16), (8, 8), (8, 4), (4, 8), (4, 4)] {
+            for (x0, y0) in [
+                (8, 8),
+                (0, 0),
+                (w as i32 - bw as i32, h as i32 - bh as i32),
+                (-3, 6),
+                (6, -3),
+                (w as i32 - 2, h as i32 - 2),
+            ] {
+                // Spans every fractional position, with the integer part both
+                // negative and positive so the arithmetic shift is exercised.
+                for mvy in -6..=6 {
+                    for mvx in -6..=6 {
+                        let mut out = vec![0u8; bw * bh];
+                        predict_luma(&p, x0, y0, (mvx, mvy), bw, bh, &mut out);
+                        for j in 0..bh {
+                            for i in 0..bw {
+                                let x = x0 + (mvx >> 2) + i as i32;
+                                let y = y0 + (mvy >> 2) + j as i32;
+                                let want =
+                                    per_sample(&p, x, y, (mvx & 3) as usize, (mvy & 3) as usize);
+                                assert_eq!(
+                                    out[j * bw + i],
+                                    want,
+                                    "{bw}x{bh} at ({x0}, {y0}) mv ({mvx}, {mvy}) sample ({i}, {j})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spec 8.4.2.2.2 per sample: four clamped loads and the bilinear weights.
+    ///
+    /// Same role as [`per_sample`] for luma — the definition the block path
+    /// has to match, including at the picture edge where the gathered patch
+    /// must reproduce the clamps.
+    fn per_sample_chroma(p: &Plane, x: i32, y: i32, xfrac: i32, yfrac: i32) -> u8 {
+        let a = p.at(x, y);
+        let b = p.at(x + 1, y);
+        let c = p.at(x, y + 1);
+        let d = p.at(x + 1, y + 1);
+        let v = ((8 - xfrac) * (8 - yfrac) * a
+            + xfrac * (8 - yfrac) * b
+            + (8 - xfrac) * yfrac * c
+            + xfrac * yfrac * d
+            + 32)
+            >> 6;
+        clip1(v)
+    }
+
+    /// Chroma counterpart of [`block_interpolation_matches_the_per_sample_definition`].
+    ///
+    /// Eighth-sample vectors instead of quarter, and the partitions chroma
+    /// actually sees (the inter path predicts 4x4 blocks; 8x8 covers a whole
+    /// chroma macroblock). Noise and edge-hanging positions for the same
+    /// reasons as the luma test.
+    #[test]
+    fn chroma_block_interpolation_matches_the_per_sample_definition() {
+        let (w, h) = (40usize, 32usize);
+        let mut data = vec![0u8; w * h];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for v in &mut data {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *v = (seed >> 33) as u8;
+        }
+        let p = plane(&data, w, h);
+
+        for (bw, bh) in [(8, 8), (8, 4), (4, 8), (4, 4)] {
+            for (x0, y0) in [
+                (4, 4),
+                (0, 0),
+                (w as i32 - bw as i32, h as i32 - bh as i32),
+                (-2, 3),
+                (3, -2),
+                (w as i32 - 1, h as i32 - 1),
+            ] {
+                // Covers every eighth-sample fraction, with the integer part
+                // both negative and positive so the arithmetic shift is
+                // exercised the same way it is for luma.
+                for mvy in -14..=14 {
+                    for mvx in -14..=14 {
+                        let mut out = vec![0u8; bw * bh];
+                        predict_chroma(&p, x0, y0, (mvx, mvy), bw, bh, &mut out);
+                        for j in 0..bh {
+                            for i in 0..bw {
+                                let x = x0 + (mvx >> 3) + i as i32;
+                                let y = y0 + (mvy >> 3) + j as i32;
+                                let want = per_sample_chroma(&p, x, y, mvx & 7, mvy & 7);
+                                assert_eq!(
+                                    out[j * bw + i],
+                                    want,
+                                    "{bw}x{bh} at ({x0}, {y0}) mv ({mvx}, {mvy}) sample ({i}, {j})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

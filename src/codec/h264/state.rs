@@ -227,13 +227,14 @@ impl PictureState {
         }
     }
 
-    /// Starts a new picture, discarding all macroblock state.
+    /// Starts a new picture, discarding all macroblock availability.
+    ///
+    /// The `mbs` store is deliberately not wiped: availability gates every
+    /// read, so a stale [`MbInfo`] is never consulted for an unclaimed
+    /// address, and filling ~8100 of them at 1080p was measurable. Each
+    /// decoded macroblock overwrites its slot in [`Self::put`].
     pub fn begin_picture(&mut self) {
         self.neighbours.begin_picture();
-        // The contents are never read before being written, since
-        // availability gates every read, but resetting keeps a state from one
-        // picture from being mistaken for this one's while debugging.
-        self.mbs.fill(MbInfo::skipped());
     }
 
     /// Marks a macroblock as belonging to `slice_id`, before decoding it.

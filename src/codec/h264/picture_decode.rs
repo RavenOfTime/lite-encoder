@@ -9,13 +9,26 @@ use super::inter;
 use super::loopfilter::{self, FilterParams};
 use super::mb::{self, MbType, Partitioning};
 use super::neighbour::MbAddr;
-use super::picture::{Dpb, Picture};
+use super::picture::{Cropping, Dpb, Picture};
 use super::recon::{self, ReconParams, Residual};
 use super::residual::{self, BlockCat};
 use super::slice::{CabacSlice, Deblocking, PictureConfig, SliceInfo, SliceKind};
 use super::state::{MbInfo, PictureState, DC_PRED_MODE};
 use super::syntax::{self, MbContext};
+use crate::media::Frame;
 use crate::Error;
+use std::time::Duration;
+
+/// What a finished picture hands back, so the next one can reuse it.
+pub struct Finished {
+    /// The picture cropped to its display rectangle.
+    pub frame: Frame,
+    pub dpb: Dpb,
+    /// The macroblock state store, to be reset and used again.
+    pub state: PictureState,
+    /// A picture buffer the DPB no longer needs, if it evicted one.
+    pub recycled: Option<Picture>,
+}
 
 /// The mutable state of one picture.  Keeping these fields together prevents
 /// accidental dimension mismatches between sample storage and neighbour state.
@@ -47,9 +60,22 @@ impl PictureDecoder {
         }
     }
 
-    pub fn with_dpb(config: PictureConfig, dpb: Dpb) -> Self {
+    /// Decodes into buffers an earlier picture finished with.
+    ///
+    /// `picture` and `state` must already be reset and sized for `config`;
+    /// they are handed in rather than allocated because at 1080p allocating
+    /// them per picture costs more than the entire deblocking filter.
+    pub fn with_resources(
+        config: PictureConfig,
+        dpb: Dpb,
+        picture: Picture,
+        state: PictureState,
+    ) -> Self {
+        debug_assert!(picture.is_sized(config.width_mbs, config.height_mbs));
         let mut decoder = Self::new(config);
         decoder.dpb = dpb;
+        decoder.picture = picture;
+        decoder.state = state;
         decoder
     }
 
@@ -65,6 +91,7 @@ impl PictureDecoder {
             self.dpb.clear();
         }
         self.picture.frame_num = slice.info.frame_num;
+        self.params.scaling = slice.scaling.clone();
         self.params.chroma_qp_offset = slice.info.chroma_qp_offset;
         self.params.constrained_intra = slice.info.constrained_intra;
         // Indexed by slice id, so a gap would silently shift every later
@@ -112,13 +139,24 @@ impl PictureDecoder {
         Ok(())
     }
 
-    /// Deblocks this picture and makes it usable as reference zero for a
-    /// following P picture.  Call only after every slice was decoded.
+    /// Deblocks this picture, hands out the displayable frame, and makes the
+    /// picture usable as reference zero for a following P picture.  Call only
+    /// after every slice was decoded.
     ///
     /// The filter runs here rather than per macroblock because it reads
     /// samples from the macroblocks below and to the right of the one it is
     /// filtering, which do not exist until the picture is complete.
-    pub fn finish(mut self) -> (Picture, Dpb) {
+    ///
+    /// Cropping to the display rectangle copies the samples out, so the coded
+    /// picture itself can then move into the DPB rather than being cloned into
+    /// it. The order matters only for cost, not for correctness: both the
+    /// frame and the reference are the deblocked picture.
+    pub fn finish(mut self, crop: Cropping, pts: Duration) -> Finished {
+        // Concealment before the filter: unclaimed macroblocks must not keep
+        // whatever samples a recycled buffer held, and the filter already
+        // skips them so greying first is order-independent for correctness
+        // but keeps a damaged picture's holes from looking like old video.
+        self.picture.grey_uncovered(&self.state.neighbours);
         loopfilter::filter_picture(
             &mut self.picture,
             &self.state,
@@ -127,8 +165,14 @@ impl PictureDecoder {
                 chroma_qp_offset: self.params.chroma_qp_offset,
             },
         );
-        self.dpb.push(self.picture.clone());
-        (self.picture, self.dpb)
+        let frame = self.picture.to_frame(crop, pts);
+        let recycled = self.dpb.push(self.picture);
+        Finished {
+            frame,
+            dpb: self.dpb,
+            state: self.state,
+            recycled,
+        }
     }
 
     fn decode_macroblock(

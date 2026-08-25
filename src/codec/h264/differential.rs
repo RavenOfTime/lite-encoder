@@ -262,13 +262,15 @@ mod tests {
     /// High-profile 8x8 path — the transform, its scan, and the mode
     /// prediction that has to interoperate with 4x4 neighbours — has no
     /// coverage without it. It is also the only fixture at a real resolution
-    /// and a real quantiser.
+    /// and a real quantiser. This committed prefix has exactly four pictures;
+    /// `camera.h264` is an ignored local full capture (224 pictures).
     #[test]
     fn our_decoder_matches_the_reference_on_a_camera_capture() {
         let stream = std::fs::read("tests/fixtures/tapo-1080p-cabac-8x8.h264")
             .expect("camera fixture missing");
         let mut subject = Frontend::new();
         let report = compare(&stream, &mut subject).expect("compare");
+        assert_eq!(report.reference_frames, 4, "camera fixture changed");
         assert!(report.matches(), "{report}");
     }
 

@@ -107,10 +107,10 @@ pub struct Frame {
 
 /// Decode compressed packets to frames.
 ///
-/// This trait is the seam that keeps the pure-Rust goal from becoming a
-/// single-vendor bet: an unproven pure-Rust H.264 decoder and an openh264
-/// FFI reference implementation are interchangeable behind it, so they can be
-/// diffed against each other on real camera streams.
+/// The shipping implementation is the pure-Rust decoder. The trait also lets
+/// tests plug in OpenH264 as a validation oracle so both can be driven over
+/// the same stream and compared sample-by-sample — that is a test concern,
+/// not an alternate production backend.
 pub trait Decoder: Send {
     fn decode(&mut self, pkt: &Packet) -> Result<Vec<Frame>, crate::Error>;
     /// Flush buffered pictures at end of stream.

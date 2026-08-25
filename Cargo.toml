@@ -3,7 +3,7 @@ name = "lite-encoder"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.98"
-description = "A focused media processor: RTSP ingest, long-running supervised recording jobs, WebM output."
+description = "Pure-Rust media stack: decode camera codecs (H.264 today, H.265 next), export WebM and other optimized formats — a focused ffmpeg alternative, not a format zoo."
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs"] }
@@ -23,7 +23,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 default = []
 # AV1 encode via rav1e. Off by default: heavy build, only needed for the transcode path.
 av1 = ["dep:rav1e"]
-# The openh264 reference decoder, used as a differential oracle in tests.
+# The openh264 reference decoder, used only for testing and validation.
 # Off by default and never enabled in a shipping build: it compiles vendored
 # C, which is exactly what the pure-Rust decoder exists to avoid. See
 # `codec::h264::reference`.
@@ -44,10 +44,11 @@ features = ["asm", "threading"]
 name = "bench_rav1e"
 required-features = ["av1"]
 
-# Cisco's H.264 implementation, built from vendored C. Test-only oracle, so it
-# is a plain optional dependency rather than a dev-dependency: Cargo does not
-# allow dev-dependencies to be optional, and an unconditional one would force
-# the C toolchain on anyone running `cargo test`.
+# Cisco's H.264 implementation, built from vendored C. Test and validation
+# only (differential oracle + bench calibration). Plain optional dependency
+# rather than a dev-dependency: Cargo does not allow those to be optional, and
+# an unconditional one would force the C toolchain on anyone running
+# `cargo test`. Never enable this feature in a shipping build.
 [dependencies.openh264]
 version = "0.9"
 optional = true
