@@ -55,8 +55,9 @@ Working and tested:
   the OpenH264 oracle bit-exactly on synthetic streams and on a real 1080p
   camera capture (224 pictures). OpenH264 is used only to validate that
   result and to calibrate throughput; it is not part of the shipping decoder.
-  Throughput work is ongoing so continuous 1080p stays comfortably ahead of
-  real time.
+  Release decode clears the continuous-recording gate of **≥60 fps at 1080p**
+  (2.0× real time at 30 fps, single thread); measured ~129 fps on the 224-picture
+  capture (~4.3× @ 30).
 - **EBML/WebM muxer** (`src/mux/`) — written for recording, not conversion.
   The Segment stays unknown-sized while open and clusters are buffered then
   written whole, so a file is playable while growing and a crash costs at most
@@ -85,8 +86,31 @@ Shipping decode is pure Rust only. OpenH264 is gated behind
 validation: differential bit-exact checks against real streams, and optional
 throughput comparison in the bench. It is never linked into a recording build.
 
+### Supported H.264 input
+
+Input must be Annex B, progressive, 8-bit YUV 4:2:0 H.264. CABAC I and P
+slices, including multiple slices per picture, are supported. The decoder
+accepts normal SPS/PPS updates, cropping, scaling lists, IDR and non-IDR
+pictures, and ordinary non-VCL metadata such as SEI and access-unit delimiters.
+
+It explicitly rejects interlacing (PAFF/MBAFF), non-8-bit video, monochrome,
+4:2:2 and 4:4:4 chroma, FMO slice groups, CAVLC, data partitioning, SVC/MVC
+and other extension NAL units, auxiliary/depth pictures, plus reserved or
+unspecified NAL types. B-slice decoding and H.265 are outside current scope.
+
+The checked-in camera fixture (`tests/fixtures/tapo-1080p-cabac-8x8.h264`) is
+four 1080p pictures; see `tests/fixtures/README.md`. The full local capture
+`camera.h264` (224 pictures) is gitignored and used for manual checks.
+
+**Throughput gate (1080p continuous recording):** best pass of
+`bench_h264` on a ≥200-picture 1080p capture must be **≥60 fps** (2.0× real
+time at 30 fps, single-threaded release). That leaves half the wall-clock for
+AV1 encode and OS jitter on the same box. The four-picture fixture is too short
+to use as the gate. Measured 2026-08-26: ~129 fps (4.3× @ 30); OpenH264 ~222 fps.
+
     cargo test
     cargo test --features reference-decoder codec::h264::differential
+    cargo test --features reference-decoder --test h264_camera_regression
     cargo run --features reference-decoder --example diff_h264 -- camera.h264
     cargo run --release --example bench_h264 -- camera.h264
 

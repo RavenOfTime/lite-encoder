@@ -200,7 +200,7 @@ fn diff_frame(reference: &Frame, subject: &Frame, index: usize) -> Option<Diverg
 mod tests {
     use super::*;
     use crate::codec::h264::decoder::Frontend;
-    use crate::codec::h264::reference::synthesize;
+    use crate::codec::h264::reference::{synthesize, synthesize_cavlc, synthesize_with_slices};
     use crate::media::Packet;
 
     /// The harness must find nothing when there is nothing to find. Running
@@ -241,6 +241,31 @@ mod tests {
         assert!(report.matches(), "{report}");
     }
 
+    /// Every CABAC slice ends independently. The next slice starts at its own
+    /// `first_mb_in_slice`, so treating it as a second picture, or reading past
+    /// its terminate bin, corrupts the picture boundary.
+    #[test]
+    fn our_decoder_matches_the_reference_with_multiple_slices_per_picture() {
+        let stream = synthesize_with_slices(256, 128, 3, 3, 2).expect("encode");
+        for access_unit in annexb::access_units(&stream.annexb) {
+            let slice_count = annexb::nal_units(access_unit)
+                .filter(|nal| matches!(nal.first().map(|header| header & 0x1f), Some(1 | 5)))
+                .count();
+            assert_eq!(slice_count, 2, "encoder did not produce two slices");
+        }
+        let mut subject = Frontend::new();
+        let report = compare(&stream.annexb, &mut subject).expect("compare");
+        assert!(report.matches(), "{report}");
+    }
+
+    #[test]
+    fn cavlc_slices_are_rejected_before_macroblock_decode() {
+        let stream = synthesize_cavlc(64, 48, 1, 1).expect("encode");
+        let access_unit = annexb::access_units(&stream.annexb)[0];
+        let error = Frontend::new().parse_access_unit(access_unit).unwrap_err();
+        assert!(error.to_string().contains("CAVLC slice; CABAC decoder required"));
+    }
+
     /// Sizes that are not a whole number of macroblocks, and pictures wide
     /// enough to have interior macroblocks in every direction. The edges are
     /// where availability derivation is decided, and a decoder can be right
@@ -262,16 +287,26 @@ mod tests {
     /// High-profile 8x8 path — the transform, its scan, and the mode
     /// prediction that has to interoperate with 4x4 neighbours — has no
     /// coverage without it. It is also the only fixture at a real resolution
-    /// and a real quantiser. This committed prefix has exactly four pictures;
-    /// `camera.h264` is an ignored local full capture (224 pictures).
+    /// and a real quantiser.
+    ///
+    /// Contract (see `tests/fixtures/README.md` and
+    /// `tests/h264_camera_regression.rs`):
+    /// - exactly **4** pictures
+    /// - display size **1920×1080**
+    /// - bit-exact against OpenH264
+    ///
+    /// The ignored local file `camera.h264` (224 pictures) is for manual
+    /// full-capture checks only.
     #[test]
     fn our_decoder_matches_the_reference_on_a_camera_capture() {
         let stream = std::fs::read("tests/fixtures/tapo-1080p-cabac-8x8.h264")
-            .expect("camera fixture missing");
+            .expect("camera fixture missing; see tests/fixtures/README.md");
         let mut subject = Frontend::new();
         let report = compare(&stream, &mut subject).expect("compare");
-        assert_eq!(report.reference_frames, 4, "camera fixture changed");
+        assert_eq!(report.reference_frames, 4, "camera fixture picture count changed");
+        assert_eq!(report.subject_frames, 4, "subject emitted the wrong picture count");
         assert!(report.matches(), "{report}");
+        assert_eq!(report.to_string(), "4 frames match exactly");
     }
 
     /// The fixture only earns its place if it really does carry the coding

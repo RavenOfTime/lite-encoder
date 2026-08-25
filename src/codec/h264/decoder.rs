@@ -65,6 +65,27 @@ impl Frontend {
                 | UnitType::SliceLayerWithoutPartitioningIdr => {
                     slices.push(slice::parse_cabac(&self.context, bytes)?);
                 }
+                // Data partitioning, SVC/MVC, auxiliary/depth pictures, and
+                // reserved/unspecified NAL types cannot be ignored: doing so
+                // would turn a supported-looking access unit into corrupted
+                // output with media silently missing.
+                UnitType::SliceDataPartitionALayer
+                | UnitType::SliceDataPartitionBLayer
+                | UnitType::SliceDataPartitionCLayer
+                | UnitType::SeqParameterSetExtension
+                | UnitType::PrefixNALUnit
+                | UnitType::SubsetSeqParameterSet
+                | UnitType::DepthParameterSet
+                | UnitType::SliceLayerWithoutPartitioningAux
+                | UnitType::SliceExtension
+                | UnitType::SliceExtensionViewComponent
+                | UnitType::Reserved(_)
+                | UnitType::Unspecified(_) => {
+                    return Err(Error::Decode(format!(
+                        "unsupported H.264 NAL unit type {}",
+                        kind.id()
+                    )));
+                }
                 _ => {}
             }
         }
@@ -172,6 +193,25 @@ fn validate_pps(pps: &PicParameterSet) -> Result<(), Error> {
 mod tests {
     use super::*;
 
+    const CAMERA_FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/tapo-1080p-cabac-8x8.h264");
+
+    fn camera_parameter_sets() -> (SeqParameterSet, PicParameterSet) {
+        let sps_bytes = annexb::nal_units(CAMERA_FIXTURE)
+            .find(|nal| nal.first().is_some_and(|header| header & 0x1f == 7))
+            .expect("fixture SPS missing");
+        let sps_nal = RefNal::new(sps_bytes, &[], true);
+        let sps = SeqParameterSet::from_bits(sps_nal.rbsp_bits()).expect("fixture SPS invalid");
+
+        let pps_bytes = annexb::nal_units(CAMERA_FIXTURE)
+            .find(|nal| nal.first().is_some_and(|header| header & 0x1f == 8))
+            .expect("fixture PPS missing");
+        let pps_nal = RefNal::new(pps_bytes, &[], true);
+        let mut context = Context::default();
+        context.put_seq_param_set(sps.clone());
+        let pps = PicParameterSet::from_bits(&context, pps_nal.rbsp_bits()).expect("fixture PPS invalid");
+        (sps, pps)
+    }
+
     #[test]
     fn metadata_only_access_units_need_no_parameter_sets() {
         let mut frontend = Frontend::new();
@@ -184,5 +224,49 @@ mod tests {
         let mut frontend = Frontend::new();
         let access_unit = [0, 0, 1, 0x80];
         assert!(frontend.parse_access_unit(&access_unit).is_err());
+    }
+
+    #[test]
+    fn unsupported_slice_partitions_and_extensions_are_rejected() {
+        for nal_type in [2, 3, 4, 13, 14, 15, 16, 19, 20, 21, 22, 24] {
+            let mut frontend = Frontend::new();
+            let access_unit = [0, 0, 1, nal_type, 0x80];
+            let error = frontend.parse_access_unit(&access_unit).unwrap_err();
+            assert!(error.to_string().contains("unsupported H.264 NAL unit type"));
+        }
+    }
+
+    #[test]
+    fn unsupported_sps_and_pps_features_are_rejected() {
+        let (sps, mut pps) = camera_parameter_sets();
+
+        for chroma in [ChromaFormat::Monochrome, ChromaFormat::YUV422, ChromaFormat::YUV444] {
+            let mut unsupported = sps.clone();
+            unsupported.chroma_info.chroma_format = chroma;
+            assert!(validate_sps(&unsupported)
+                .unwrap_err()
+                .to_string()
+                .contains("only 4:2:0"));
+        }
+        let mut high_depth = sps.clone();
+        high_depth.chroma_info.bit_depth_luma_minus8 = 2;
+        assert!(validate_sps(&high_depth)
+            .unwrap_err()
+            .to_string()
+            .contains("only 8-bit"));
+
+        let mut interlaced = sps;
+        interlaced.frame_mbs_flags = FrameMbsFlags::Fields {
+            mb_adaptive_frame_field_flag: true,
+        };
+        assert!(validate_sps(&interlaced)
+            .unwrap_err()
+            .to_string()
+            .contains("interlaced"));
+
+        pps.slice_groups = Some(h264_reader::nal::pps::SliceGroup::Dispersed {
+            num_slice_groups_minus1: 1,
+        });
+        assert!(validate_pps(&pps).unwrap_err().to_string().contains("FMO"));
     }
 }

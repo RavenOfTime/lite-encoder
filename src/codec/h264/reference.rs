@@ -117,7 +117,42 @@ pub fn synthesize(
     frames: usize,
     keyframe_interval: u32,
 ) -> Result<SyntheticStream, Error> {
-    let mut encoder = RawEncoder::new(width, height, keyframe_interval)?;
+    synthesize_with_options(width, height, frames, keyframe_interval, 1, true)
+}
+
+/// As [`synthesize`], but splits every picture into `slice_count` CABAC
+/// slices. Used to exercise picture assembly rather than a single-slice fast
+/// path.
+pub fn synthesize_with_slices(
+    width: usize,
+    height: usize,
+    frames: usize,
+    keyframe_interval: u32,
+    slice_count: u32,
+) -> Result<SyntheticStream, Error> {
+    synthesize_with_options(width, height, frames, keyframe_interval, slice_count, true)
+}
+
+/// Generates a CAVLC stream solely to verify the shipping decoder rejects it.
+pub fn synthesize_cavlc(
+    width: usize,
+    height: usize,
+    frames: usize,
+    keyframe_interval: u32,
+) -> Result<SyntheticStream, Error> {
+    synthesize_with_options(width, height, frames, keyframe_interval, 1, false)
+}
+
+fn synthesize_with_options(
+    width: usize,
+    height: usize,
+    frames: usize,
+    keyframe_interval: u32,
+    slice_count: u32,
+    cabac: bool,
+) -> Result<SyntheticStream, Error> {
+    assert!(slice_count > 0, "an encoded picture needs at least one slice");
+    let mut encoder = RawEncoder::new(width, height, keyframe_interval, slice_count, cabac)?;
     let mut annexb = Vec::new();
     for i in 0..frames {
         let (y, u, v) = test_pattern(width, height, i);
@@ -146,10 +181,16 @@ struct RawEncoder {
 }
 
 impl RawEncoder {
-    fn new(width: usize, height: usize, keyframe_interval: u32) -> Result<Self, Error> {
+    fn new(
+        width: usize,
+        height: usize,
+        keyframe_interval: u32,
+        slice_count: u32,
+        cabac: bool,
+    ) -> Result<Self, Error> {
         use openh264_sys2::{
-            SEncParamExt, API, CAMERA_VIDEO_REAL_TIME, ISVCEncoder, PRO_HIGH, RC_OFF_MODE,
-            SM_SINGLE_SLICE,
+            API, CAMERA_VIDEO_REAL_TIME, ISVCEncoder, SEncParamExt, PRO_HIGH, RC_OFF_MODE,
+            SM_FIXEDSLCNUM_SLICE, SM_SINGLE_SLICE,
         };
 
         let api = OpenH264API::from_source();
@@ -176,7 +217,7 @@ impl RawEncoder {
             params.fMaxFrameRate = 25.0;
             params.uiIntraPeriod = keyframe_interval;
             // The whole reason this exists.
-            params.iEntropyCodingModeFlag = 1;
+            params.iEntropyCodingModeFlag = i32::from(cabac);
             // Deterministic output matters more than bitrate: rate control
             // that adapts to wall-clock timing, or a scene-change heuristic
             // that inserts a keyframe of its own, would make the fixture
@@ -197,8 +238,12 @@ impl RawEncoder {
             params.sSpatialLayers[0].iVideoWidth = width as c_int;
             params.sSpatialLayers[0].iVideoHeight = height as c_int;
             params.sSpatialLayers[0].fFrameRate = 25.0;
-            params.sSpatialLayers[0].sSliceArgument.uiSliceMode = SM_SINGLE_SLICE;
-            params.sSpatialLayers[0].sSliceArgument.uiSliceNum = 1;
+            params.sSpatialLayers[0].sSliceArgument.uiSliceMode = if slice_count == 1 {
+                SM_SINGLE_SLICE
+            } else {
+                SM_FIXEDSLCNUM_SLICE
+            };
+            params.sSpatialLayers[0].sSliceArgument.uiSliceNum = slice_count;
 
             let Some(initialize) = vtbl.InitializeExt else {
                 api.WelsDestroySVCEncoder(encoder);

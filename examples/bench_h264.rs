@@ -3,10 +3,22 @@
 //! Throughput is a correctness-adjacent property here: this decoder exists to
 //! feed a long-running recorder, so a stream it decodes accurately but slower
 //! than real time is still a stream it cannot record.
+//!
+//! # Acceptance gate
+//!
+//! Continuous 1080p recording shares the machine with AV1 encode. The minimum
+//! acceptable decode rate is **2.0× real time at 30 fps** — **60 fps** —
+//! measured single-threaded on a release build over a long (≥200 picture)
+//! High-profile capture. That leaves half the wall-clock for encode and OS
+//! jitter. The checked-in four-picture fixture is too short to use as the
+//! gate: I-frame and warm-up cost dominate.
 
 use std::time::{Duration, Instant};
 
 use lite_encoder::codec::h264::{annexb, decoder::Frontend};
+
+/// Minimum acceptable best-pass fps at 1080p (2.0× real time at 30 fps).
+const MIN_FPS_1080P: f64 = 60.0;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = std::env::args()
@@ -17,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
 
-    let data = std::fs::read(input)?;
+    let data = std::fs::read(&input)?;
     let access_units = annexb::access_units(&data);
     println!("{} access units, {} bytes", access_units.len(), data.len());
 
@@ -53,6 +65,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     for target in [25.0, 30.0] {
         println!("  {:.2}x real time at {target} fps", fps / target);
+    }
+
+    let gate_applies = size == (1920, 1080) && frames >= 200;
+    if gate_applies {
+        let margin = fps / MIN_FPS_1080P;
+        println!(
+            "\nacceptance gate: {:.0} fps min at 1080p (2.0× @ 30 fps)",
+            MIN_FPS_1080P
+        );
+        if fps >= MIN_FPS_1080P {
+            println!("  PASS ({:.2}× the floor)", margin);
+        } else {
+            println!("  FAIL ({:.2}× the floor)", margin);
+            std::process::exit(1);
+        }
+    } else if size == (1920, 1080) {
+        println!(
+            "\n(skipping acceptance gate: need ≥200 pictures for a stable rate; got {frames})"
+        );
     }
 
     // The oracle's throughput is the only calibration available: it says
