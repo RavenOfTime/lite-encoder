@@ -45,22 +45,34 @@ Working and tested:
   typed event stream (segment started/finished, source lost, timestamp
   discontinuity, dropped media, progress). `Reporter` is a trait, so a gRPC or
   HTTP surface is an implementation rather than a rewrite.
+- **H.264 CABAC decoder prototype** (`src/codec/h264/`) — Annex B access-unit
+  parsing, SPS/PPS lifetime, CABAC macroblock syntax, intra/inter prediction,
+  residual reconstruction, deblocking, cropped YUV420 output, and a small
+  decoded-picture buffer. It currently accepts 8-bit, 4:2:0, progressive CABAC
+  I/P pictures without FMO slice groups.
 
-Not built yet: the decode/encode stages, the job supervisor loop that drives
-segment rollover and reconnect backoff, and the transport surface.
+In progress:
 
-## The open decision: where H.264 decode comes from
+- **H.264 decoder validation** — the prototype decodes a real camera capture
+  through 224 pictures and emits the expected 1920×1080 first frame, but it
+  does not yet match the OpenH264 oracle exactly. The current first divergence
+  is in frame 0, luma macroblock `(76, 0)`. The differential harness reports
+  the first bad sample to make this debugging tractable.
+- **Encode and recording pipeline** — AV1 encoding, the job supervisor loop
+  that drives segment rollover/reconnect backoff, and the transport surface
+  are still not built.
 
-The goal is pure Rust. Encode is fine — `rav1e` is mature and battle-tested.
-**Decode is the gap.** Pure-Rust H.264 decoders now exist on crates.io, but
-the ones that claim full coverage come from a single org mass-publishing a
-whole "remade ffmpeg" ecosystem, with no production track record (a sibling
-crate self-describes as a "scaffold pending clean-room re-implementation").
+## H.264 decoder development
 
-Rather than bet a 24/7 recorder on that, `media::Decoder` is a trait. A
-candidate pure-Rust decoder and an `openh264` FFI reference are
-interchangeable behind it, so they can be diffed frame-by-frame on real camera
-output before anything is trusted. Validate, then commit.
+The decoder is deliberately pure Rust. `media::Decoder` keeps it replaceable,
+and the optional OpenH264 integration is retained strictly as a differential
+testing oracle, never as the intended shipping decoder.
+
+Validation is exact, sample-by-sample rather than visual. A one-bit CABAC,
+prediction, or transform mistake quickly propagates inside and across pictures;
+the useful failure is therefore the first differing coordinate, not an average
+quality score. Run it on real Annex B camera captures before treating any
+decoder path as reliable.
 
 ## Layout
 
@@ -77,6 +89,16 @@ Pinned to Rust 1.98 via `rust-toolchain.toml` (a transitive dependency of
 
     cargo test
     cargo clippy --all-targets
+
+Decode the first picture in an Annex B H.264 elementary stream into a luma PGM
+for inspection:
+
+    cargo run --example decode_h264 -- camera.h264 first-frame.pgm
+
+Compare every decoded sample against the optional OpenH264 oracle. This builds
+vendored C and is development-only:
+
+    cargo run --features reference-decoder --example diff_h264 -- camera.h264
 
 Emit a structurally complete WebM and check it with a parser that shares no
 code with the muxer:
