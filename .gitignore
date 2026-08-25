@@ -1,5 +1,6 @@
 target/
 *.webm
+todo.md
 
 # Camera captures and decoded frame dumps, at the repository root only.
 # Anchored so that tests/fixtures/ keeps its committed streams.

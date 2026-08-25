@@ -211,7 +211,9 @@ fn validate_pps(pps: &PicParameterSet) -> Result<(), Error> {
         return Err(Error::Decode("weighted P prediction is unsupported".into()));
     }
     if pps.redundant_pic_cnt_present_flag {
-        return Err(Error::Decode("redundant coded pictures are unsupported".into()));
+        return Err(Error::Decode(
+            "redundant coded pictures are unsupported".into(),
+        ));
     }
     Ok(())
 }
@@ -288,6 +290,33 @@ mod tests {
     }
 
     #[test]
+    fn tapo_fixture_parameter_sets_reject_unsupported_reference_flags() {
+        let (mut sps, mut pps) = camera_parameter_sets();
+        assert!(!sps.gaps_in_frame_num_value_allowed_flag);
+        assert!(!pps.weighted_pred_flag);
+        assert!(!pps.redundant_pic_cnt_present_flag);
+
+        sps.gaps_in_frame_num_value_allowed_flag = true;
+        assert!(validate_sps(&sps)
+            .unwrap_err()
+            .to_string()
+            .contains("frame number gaps"));
+
+        pps.weighted_pred_flag = true;
+        assert!(validate_pps(&pps)
+            .unwrap_err()
+            .to_string()
+            .contains("weighted P prediction"));
+
+        pps.weighted_pred_flag = false;
+        pps.redundant_pic_cnt_present_flag = true;
+        assert!(validate_pps(&pps)
+            .unwrap_err()
+            .to_string()
+            .contains("redundant coded pictures"));
+    }
+
+    #[test]
     fn unsupported_sps_and_pps_features_are_rejected() {
         let (sps, mut pps) = camera_parameter_sets();
 
@@ -319,30 +348,9 @@ mod tests {
             .to_string()
             .contains("interlaced"));
 
-        let mut gaps = sps;
-        gaps.gaps_in_frame_num_value_allowed_flag = true;
-        assert!(validate_sps(&gaps)
-            .unwrap_err()
-            .to_string()
-            .contains("frame number gaps"));
-
         pps.slice_groups = Some(h264_reader::nal::pps::SliceGroup::Dispersed {
             num_slice_groups_minus1: 1,
         });
         assert!(validate_pps(&pps).unwrap_err().to_string().contains("FMO"));
-
-        let (_, mut weighted) = camera_parameter_sets();
-        weighted.weighted_pred_flag = true;
-        assert!(validate_pps(&weighted)
-            .unwrap_err()
-            .to_string()
-            .contains("weighted P prediction"));
-
-        let (_, mut redundant) = camera_parameter_sets();
-        redundant.redundant_pic_cnt_present_flag = true;
-        assert!(validate_pps(&redundant)
-            .unwrap_err()
-            .to_string()
-            .contains("redundant coded pictures"));
     }
 }

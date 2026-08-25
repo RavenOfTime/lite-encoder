@@ -12,12 +12,15 @@ encode the 8×8 transform, so synthetic streams alone never cover that path.
 | Pictures | **4** (IDR then three P) |
 | Display size | **1920×1080** (coded 1920×1088 with crop) |
 | Profile / tools | High, CABAC, 8×8 transform, progressive 8-bit 4:2:0 |
+| Reference handling | P slices: `ref_pic_list_modification Subtract(0)` + MMCO-1; all VCL NALs `nal_ref_idc > 0`; no weighted/redundant/gap syntax (see README) |
 | Size on disk | 63 616 bytes |
 
 Regression coverage:
 
 - Default `cargo test`: decode all four pictures at 1920×1080 without panic
   (`tests/h264_camera_regression.rs`).
+- Default `cargo test`: reference-handling profile for the Tapo stream
+  (`tests/h264_reference_handling.rs`).
 - `--features reference-decoder`: bit-exact match against OpenH264 for those
   four pictures (`codec::h264::differential` and the same integration test).
 

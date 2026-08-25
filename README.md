@@ -103,6 +103,31 @@ short-term adaptive marking (MMCO 1 and 5) plus the sliding window are
 implemented; the Tapo fixture uses `Subtract(0)` and MMCO-1 on P slices.
 B-slice decoding and H.265 are outside current scope.
 
+It also rejects frame-number gaps (`gaps_in_frame_num_value_allowed_flag`),
+redundant coded pictures (`redundant_pic_cnt_present_flag`), and disposable
+pictures are honoured when `nal_ref_idc == 0` (display without entering the
+DPB). See **Tapo fixture — reference handling** below for what the checked-in
+camera stream actually exercises versus what is only rejected.
+
+### Tapo fixture — reference handling
+
+Checked-in stream: `tests/fixtures/tapo-1080p-cabac-8x8.h264` (four 1080p
+pictures). `tests/h264_reference_handling.rs` locks the exercised paths;
+rejection tests live in `src/codec/h264/decoder.rs`, `slice.rs`, and
+`picture.rs`.
+
+| Reference tool | Tapo fixture | Decoder |
+|---|---|---|
+| `ref_pic_list_modification` `Subtract(0)` on P slices | **yes** | implemented (`Dpb::list0`) |
+| Adaptive MMCO-1 (`ShortTermUnused`) on P slices | **yes** | implemented (`Dpb::mark_reference`) |
+| Sliding-window / IDR marking | **yes** (IDR + P) | implemented |
+| `nal_ref_idc == 0` disposable pictures | **no** (all VCL NALs are references) | honoured — display, no DPB entry |
+| Weighted P prediction | **no** | rejected at PPS and slice header |
+| MMCO-5 (`AllUnused`) | **no** | implemented; resets stored `frame_num` |
+| Redundant coded pictures | **no** | rejected at PPS and slice header |
+| Frame-number gaps | **no** (`gaps_in_frame_num_value_allowed_flag` false) | rejected at SPS |
+| Long-term references / list mods | **no** | rejected at slice header |
+
 The checked-in camera fixture (`tests/fixtures/tapo-1080p-cabac-8x8.h264`) is
 four 1080p pictures; see `tests/fixtures/README.md`. The full local capture
 `camera.h264` (224 pictures) is gitignored and used for manual checks.
