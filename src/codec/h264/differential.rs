@@ -230,14 +230,72 @@ mod tests {
         assert!(report.matches(), "{report}");
     }
 
-    /// And on a stream with P pictures, which adds motion compensation and
-    /// the reference picture list to the surface under test.
+    /// And on a stream with P pictures, which adds motion compensation, the
+    /// reference picture list, skipped macroblocks and the intra-in-P
+    /// macroblock type to the surface under test.
     #[test]
     fn our_decoder_matches_the_reference_with_inter_prediction() {
         let stream = synthesize(64, 48, 6, 6).expect("encode");
         let mut subject = Frontend::new();
         let report = compare(&stream.annexb, &mut subject).expect("compare");
         assert!(report.matches(), "{report}");
+    }
+
+    /// Sizes that are not a whole number of macroblocks, and pictures wide
+    /// enough to have interior macroblocks in every direction. The edges are
+    /// where availability derivation is decided, and a decoder can be right
+    /// in the middle of a picture and wrong along all four sides.
+    #[test]
+    fn our_decoder_matches_the_reference_across_picture_sizes() {
+        for (w, h, frames, gop) in [(176, 144, 4, 2), (320, 240, 3, 1), (208, 120, 4, 4)] {
+            let stream = synthesize(w, h, frames, gop).expect("encode");
+            let mut subject = Frontend::new();
+            let report = compare(&stream.annexb, &mut subject).expect("compare");
+            assert!(report.matches(), "{w}x{h} gop {gop}: {report}");
+        }
+    }
+
+    /// A real capture from the camera this project exists to record.
+    ///
+    /// This fixture is not a luxury. openh264 cannot encode the 8x8 transform
+    /// at all, so every synthetic stream above is 4x4-only, and the entire
+    /// High-profile 8x8 path — the transform, its scan, and the mode
+    /// prediction that has to interoperate with 4x4 neighbours — has no
+    /// coverage without it. It is also the only fixture at a real resolution
+    /// and a real quantiser.
+    #[test]
+    fn our_decoder_matches_the_reference_on_a_camera_capture() {
+        let stream = std::fs::read("tests/fixtures/tapo-1080p-cabac-8x8.h264")
+            .expect("camera fixture missing");
+        let mut subject = Frontend::new();
+        let report = compare(&stream, &mut subject).expect("compare");
+        assert!(report.matches(), "{report}");
+    }
+
+    /// The fixture only earns its place if it really does carry the coding
+    /// tools the synthetic streams cannot, so check that rather than trusting
+    /// the file name.
+    #[test]
+    fn the_camera_fixture_uses_the_8x8_transform_and_cabac() {
+        use h264_reader::nal::{Nal, RefNal, UnitType};
+
+        let stream = std::fs::read("tests/fixtures/tapo-1080p-cabac-8x8.h264")
+            .expect("camera fixture missing");
+        let mut frontend = Frontend::new();
+        let units = annexb::access_units(&stream);
+        assert!(units.len() >= 2, "fixture has too few access units");
+
+        let slices = frontend.parse_access_unit(units[0]).expect("parse");
+        let info = slices.first().expect("no slice in first access unit").info;
+        assert!(info.transform_8x8_enabled, "fixture does not enable 8x8");
+        assert_eq!(info.picture.width_mbs * 16, 1920);
+
+        // Reaching `parse_cabac` at all means `entropy_coding_mode_flag` was
+        // set; it rejects CAVLC outright.
+        let idr = annexb::nal_units(units[0])
+            .any(|n| RefNal::new(n, &[], true).header().unwrap().nal_unit_type()
+                == UnitType::SliceLayerWithoutPartitioningIdr);
+        assert!(idr, "fixture does not start with an IDR");
     }
 
     /// And it must find something when there is. A decoder that flips the low

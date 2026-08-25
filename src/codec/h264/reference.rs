@@ -190,11 +190,6 @@ impl RawEncoder {
             params.bEnableAdaptiveQuant = false;
             params.bEnableDenoise = false;
             params.bEnableLongTermReference = false;
-            // Diagnostic escape hatch: with the loop filter off, any
-            // divergence is reconstruction rather than deblocking.
-            if std::env::var_os("LITE_ENCODER_NO_DEBLOCK").is_some() {
-                params.iLoopFilterDisableIdc = 1;
-            }
             params.iMultipleThreadIdc = 1;
             params.iSpatialLayerNum = 1;
             params.iTemporalLayerNum = 1;

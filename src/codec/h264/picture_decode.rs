@@ -12,7 +12,7 @@ use super::neighbour::MbAddr;
 use super::picture::{Dpb, Picture};
 use super::recon::{self, ReconParams, Residual};
 use super::residual::{self, BlockCat};
-use super::slice::{CabacSlice, Deblocking, PictureConfig, SliceKind};
+use super::slice::{CabacSlice, Deblocking, PictureConfig, SliceInfo, SliceKind};
 use super::state::{MbInfo, PictureState, DC_PRED_MODE};
 use super::syntax::{self, MbContext};
 use crate::Error;
@@ -89,30 +89,7 @@ impl PictureDecoder {
         let total = self.config.width_mbs * self.config.height_mbs;
         for addr in slice.info.first_mb..total {
             self.state.begin_macroblock(addr, slice_id);
-            let (info, residual) = self.decode_macroblock(
-                &mut d,
-                &mut cx,
-                addr,
-                slice.info.kind,
-                qp,
-                slice.info.transform_8x8_enabled,
-                slice.info.num_ref_idx_l0,
-            )?;
-            if std::env::var_os("LITE_ENCODER_TRACE_MB").is_some() {
-                eprintln!("mb {addr}: {info:?}");
-            }
-            if std::env::var("LITE_ENCODER_TRACE_RESIDUAL")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                == Some(addr)
-            {
-                eprintln!("  luma_dc: {:?}", residual.luma_dc);
-                for (i, b) in residual.luma.iter().enumerate() {
-                    if b.iter().any(|&c| c != 0) {
-                        eprintln!("  luma[{i}]: {b:?}");
-                    }
-                }
-            }
+            let (info, residual) = self.decode_macroblock(&mut d, &mut cx, addr, qp, &slice.info)?;
             qp = info.qp;
             recon::reconstruct(
                 &mut self.picture,
@@ -125,15 +102,11 @@ impl PictureDecoder {
             )
             .map_err(|error| Error::Decode(format!("macroblock {addr} {info:?}: {error}")))?;
             self.state.put(addr, slice_id, info);
-            let end = d.decode_terminate() == 1;
-            if std::env::var_os("LITE_ENCODER_TRACE_MB").is_some() {
-                eprintln!("  after mb {addr}: terminate={end} overran={}", d.overran());
-            }
-            if end {
+            if d.decode_terminate() == 1 {
                 break;
             }
         }
-        if d.overran() && std::env::var_os("LITE_ENCODER_IGNORE_OVERRUN").is_none() {
+        if d.overran() {
             return Err(Error::Decode("truncated CABAC macroblock data".into()));
         }
         Ok(())
@@ -163,11 +136,15 @@ impl PictureDecoder {
         d: &mut ArithDecoder<'_>,
         cx: &mut ContextState,
         addr: MbAddr,
-        kind: SliceKind,
         qp: u8,
-        allow_8x8: bool,
-        num_ref_idx_l0: usize,
+        slice: &SliceInfo,
     ) -> Result<(MbInfo, Residual), Error> {
+        let SliceInfo {
+            kind,
+            transform_8x8_enabled: allow_8x8,
+            num_ref_idx_l0,
+            ..
+        } = *slice;
         let skip = kind == SliceKind::P
             && syntax::decode_mb_skip_flag(
                 d,
@@ -346,19 +323,27 @@ fn decode_intra(
         for blk in 0..blocks {
             let n = &state.neighbours;
             let (left, above, dst) = if use_8x8 {
-                let left =
-                    n.luma_8x8_neighbour(addr, blk, -1, 0)
+                // Spec 8.3.2.1: an 8x8 block predicts its mode from a
+                // *particular* 4x4 sub-block of each neighbouring 8x8 block —
+                // the top-right one for the neighbour to the left, the
+                // bottom-left one for the neighbour above. Those are the two
+                // sub-blocks that actually touch this block's edges.
+                //
+                // It only matters when the neighbouring macroblock is coded
+                // Intra_4x4 and so has four genuinely different modes in that
+                // 8x8; when it is Intra_8x8 all four hold the same mode.
+                // Getting it wrong therefore mispredicts the mode only where
+                // an 8x8 macroblock sits beside a 4x4 one — and a mispredicted
+                // mode decodes the same number of bins, so it corrupts the
+                // picture without desynchronising CABAC.
+                let sub = |dx, dy, corner| {
+                    n.luma_8x8_neighbour(addr, blk, dx, dy)
                         .map(|b| super::neighbour::BlockRef {
                             mb: b.mb,
-                            blk: b.blk * 4,
-                        });
-                let above =
-                    n.luma_8x8_neighbour(addr, blk, 0, -1)
-                        .map(|b| super::neighbour::BlockRef {
-                            mb: b.mb,
-                            blk: b.blk * 4,
-                        });
-                (left, above, blk * 4)
+                            blk: b.blk * 4 + corner,
+                        })
+                };
+                (sub(-1, 0, 1), sub(0, -1, 2), blk * 4)
             } else {
                 (n.luma_4x4_a(addr, blk), n.luma_4x4_b(addr, blk), blk)
             };

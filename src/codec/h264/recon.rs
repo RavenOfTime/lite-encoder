@@ -415,7 +415,7 @@ fn reconstruct_chroma(
         let mut dc = residual.chroma_dc[comp];
         transform::dequant_chroma_dc(&mut dc, qp, weights);
 
-        for blk in 0..4usize {
+        for (blk, &dc_level) in dc.iter().enumerate() {
             // Chroma DC is always coded; AC only when the pattern says 2.
             let mut block = if info.cbp_chroma == 2 {
                 dezigzag_4x4(&residual.chroma[comp][blk])
@@ -423,7 +423,7 @@ fn reconstruct_chroma(
                 [0; 16]
             };
             transform::dequant_4x4(&mut block, qp, weights, true);
-            block[0] = dc[blk];
+            block[0] = dc_level;
             transform::inverse_4x4(&mut block);
             let (bx, by) = ((blk % 2) * 4, (blk / 2) * 4);
             transform::add_residual_4x4(
@@ -466,13 +466,13 @@ fn gather_luma_neighbours<'buf>(
     let has_top = sample(bx as i32, by as i32 - 1).is_some();
     let mut top_len = 0;
     if has_top {
-        for i in 0..size {
-            top[i] = sample(bx as i32 + i as i32, by as i32 - 1).unwrap_or(0);
+        for (i, slot) in top[..size].iter_mut().enumerate() {
+            *slot = sample(bx as i32 + i as i32, by as i32 - 1).unwrap_or(0);
         }
         top_len = size;
         if (0..size).all(|i| sample((bx + size + i) as i32, by as i32 - 1).is_some()) {
-            for i in 0..size {
-                top[size + i] = sample((bx + size + i) as i32, by as i32 - 1).unwrap_or(0);
+            for (i, slot) in top[size..2 * size].iter_mut().enumerate() {
+                *slot = sample((bx + size + i) as i32, by as i32 - 1).unwrap_or(0);
             }
             top_len = 2 * size;
         }
@@ -480,8 +480,8 @@ fn gather_luma_neighbours<'buf>(
 
     let has_left = sample(bx as i32 - 1, by as i32).is_some();
     if has_left {
-        for i in 0..size {
-            left[i] = sample(bx as i32 - 1, by as i32 + i as i32).unwrap_or(0);
+        for (i, slot) in left[..size].iter_mut().enumerate() {
+            *slot = sample(bx as i32 - 1, by as i32 + i as i32).unwrap_or(0);
         }
     }
 
@@ -507,14 +507,14 @@ fn gather_chroma_neighbours<'buf>(
 
     let has_top = sample(0, -1).is_some();
     if has_top {
-        for i in 0..8 {
-            top[i] = sample(i as i32, -1).unwrap_or(0);
+        for (i, slot) in top[..8].iter_mut().enumerate() {
+            *slot = sample(i as i32, -1).unwrap_or(0);
         }
     }
     let has_left = sample(-1, 0).is_some();
     if has_left {
-        for i in 0..8 {
-            left[i] = sample(-1, i as i32).unwrap_or(0);
+        for (i, slot) in left[..8].iter_mut().enumerate() {
+            *slot = sample(-1, i as i32).unwrap_or(0);
         }
     }
 

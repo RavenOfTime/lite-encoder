@@ -1,2 +1,7 @@
 target/
 *.webm
+
+# Camera captures and decoded frame dumps, at the repository root only.
+# Anchored so that tests/fixtures/ keeps its committed streams.
+/*.h264
+/*.pgm
