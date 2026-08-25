@@ -44,6 +44,10 @@ features = ["asm", "threading"]
 name = "bench_rav1e"
 required-features = ["av1"]
 
+[[example]]
+name = "gen_h264_multislice_fixture"
+required-features = ["reference-decoder"]
+
 # Cisco's H.264 implementation, built from vendored C. Test and validation
 # only (differential oracle + bench calibration). Plain optional dependency
 # rather than a dev-dependency: Cargo does not allow those to be optional, and

@@ -442,7 +442,7 @@ impl Dpb {
     /// buffer reuse.
     pub fn mark_reference(
         &mut self,
-        picture: Picture,
+        mut picture: Picture,
         marking: &RefMarking,
     ) -> Result<Vec<Picture>, crate::Error> {
         let mut recycled = match marking {
@@ -451,7 +451,16 @@ impl Dpb {
                     "non-reference picture cannot enter the DPB".into(),
                 ))
             }
-            RefMarking::Adaptive(ops) => self.apply_mmco(picture.frame_num, ops)?,
+            RefMarking::Adaptive(ops) => {
+                let recycled = self.apply_mmco(picture.frame_num, ops)?;
+                // Spec 8.2.5.4.5: after AllRefPicturesUnused the current
+                // picture's FrameNum is inferred as 0 regardless of the slice
+                // header value, so the next picture restarts at 1.
+                if ops.iter().any(|op| matches!(op, MmcoOp::AllUnused)) {
+                    picture.frame_num = 0;
+                }
+                recycled
+            }
             RefMarking::SlidingWindow | RefMarking::Idr => Vec::new(),
         };
         if let Some(evicted) = self.push(picture) {
@@ -596,6 +605,39 @@ mod tests {
         assert_eq!(
             list.iter().map(|p| p.frame_num).collect::<Vec<_>>(),
             vec![2, 3, 1]
+        );
+    }
+
+    #[test]
+    fn mmco_all_unused_resets_the_current_pictures_frame_num() {
+        let mut dpb = Dpb::new(4, 16);
+        let _ = dpb.push(picture_numbered(5));
+        let current = picture_numbered(8);
+        let recycled = dpb
+            .mark_reference(current, &RefMarking::Adaptive(vec![MmcoOp::AllUnused]))
+            .expect("mark");
+        assert_eq!(recycled.len(), 1);
+        assert_eq!(recycled[0].frame_num, 5);
+        assert_eq!(dpb.len(), 1);
+        assert_eq!(dpb.get(0).unwrap().frame_num, 0);
+    }
+
+    #[test]
+    fn list0_reorder_works_after_mmco_all_unused_resets_frame_num() {
+        let mut dpb = Dpb::new(4, 16);
+        let _ = dpb.push(picture_numbered(5));
+        let _ = dpb
+            .mark_reference(
+                picture_numbered(8),
+                &RefMarking::Adaptive(vec![MmcoOp::AllUnused]),
+            )
+            .expect("mark");
+        let _ = dpb.push(picture_numbered(1));
+        // Default L0 for curr=2 is [1, 0]. Subtract(1) selects PicNum 0.
+        let list = dpb.list0(2, &[RefListMod::Subtract(1)], 2).expect("list0");
+        assert_eq!(
+            list.iter().map(|p| p.frame_num).collect::<Vec<_>>(),
+            vec![0, 1]
         );
     }
 

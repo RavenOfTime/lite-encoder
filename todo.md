@@ -32,11 +32,11 @@ support come after that vertical slice works.
       silently emit corrupted frames.
   - [x] Tail-truncation of the fixture's first access unit is rejected without
         panicking and without emitting a frame (`tests/h264_robustness.rs`).
-  - [ ] Multi-slice coverage exists only as
-        `differential::our_decoder_matches_the_reference_with_multiple_slices_per_picture`,
-        which sits behind `reference-decoder` and therefore never runs in
-        default CI. Add a multi-slice case that runs on a plain `cargo test`.
-  - [ ] Truncation coverage is a single access unit cut at the tail. Add
+  - [x] **DONE (Codex):** Multi-slice picture assembly now runs in default CI
+        over a checked-in three-picture, two-CABAC-slices-per-picture fixture.
+        It locks slice count, dimensions, timestamps, and pixel fingerprints;
+        `reference-decoder` additionally proves bit-exact OpenH264 agreement.
+  - [ ] **IN PROGRESS (Codex):** Truncation coverage is a single access unit cut at the tail. Add
         mid-stream truncation (a P access unit, not only the IDR), a corrupted
         NAL header, bit-flipped slice payloads, and a P slice arriving with an
         empty DPB.
@@ -99,12 +99,19 @@ needs, and only with differential proof.
       Long-term MMCO / IDR `long_term_reference_flag` are rejected. The Tapo
       fixture's adaptive mark-previous-unused path is covered by unit tests
       and still bit-exact on the regression fixture.
-- [ ] **Redundant coded pictures are not discarded.** `redundant_pic_cnt` is
-      never inspected, so a redundant slice would be decoded as ordinary
-      picture data. Reject when `redundant_pic_cnt_present_flag` is set.
-- [ ] **`gaps_in_frame_num_value_allowed_flag` is not handled.** Decide
-      whether to synthesize the "non-existing" frames or reject the stream,
-      and test the chosen behaviour.
+- [x] **DONE (Auto): Follow-up on the above: MMCO 5 does not reset `frame_num`.**
+      Spec 8.2.5.4.5: `mark_reference` zeroes the current picture's stored
+      `frame_num` after `AllUnused`; unit tests cover the reset and a
+      `ref_pic_list_modification` reorder across it.
+- [x] **DONE (Auto): Redundant coded pictures are not discarded.** PPS
+      registration rejects `redundant_pic_cnt_present_flag`; slice parsing
+      also rejects `redundant_pic_cnt > 0` as defense in depth. Unit test in
+      `decoder.rs` alongside the other PPS rejection cases.
+- [x] **DONE (Auto): `gaps_in_frame_num_value_allowed_flag` is not handled.**
+      Decision: reject at SPS registration (do not synthesize non-existing
+      frames). Surveillance cameras emit contiguous `frame_num` sequences;
+      synthesizing gap placeholders would be half-implemented DPB logic with
+      no target use case. Unit test in `decoder.rs`.
 - [ ] Add a rejection (or differential) test per item above, and record in the
       README which of these the target camera actually exercises.
 
@@ -132,6 +139,35 @@ needs, and only with differential proof.
       (keyframe + PTS on first packet, size mismatch rejected, non-empty
       `av1C`, flush drains every sent frame) — **not yet wired into the job
       runner**, which does not exist yet either (see the next section).
+- [ ] **No encode throughput gate exists.** The decode gate (≥60 fps at 1080p)
+      is justified by reserving *half* the wall-clock for AV1 encode, but
+      nothing measures whether encode actually fits in that half. The only
+      rav1e number on record is ~2x real time at **640x360** from
+      `bench_rav1e.rs`; 1080p is roughly 9x the pixels and has never been
+      measured with the shipping `Av1Encoder` configuration. Extend
+      `bench_rav1e` (or add `bench_av1`) to drive `codec::av1::Av1Encoder` over
+      decoded 1080p camera frames, record the achieved fps, and set a pass/fail
+      floor the way `bench_h264` does. If 1080p AV1 misses real time at speed
+      8, that is a product decision (lower resolution, more threads, or a
+      different encode target) and it should surface now, not after the runner
+      is built.
+- [ ] **`Av1Encoder::packet_from` invents a timestamp on a cache miss.**
+      `self.pending.remove(&pkt.input_frameno).unwrap_or_default()` yields
+      `Duration::ZERO` when the frame number is unknown, which the muxer would
+      write as a real cluster timestamp. Contradicts the project's
+      report-every-correction doctrine. Return `Error::Encode` instead, and
+      assert `pending` is empty after `flush`.
+- [ ] **`Av1Encoder::copy_plane` panics on a malformed `Frame`.** It slices
+      `src[row * src_stride .. row * src_stride + width]` with no check that
+      `strides` are at least `width` or that each plane is long enough.
+      Frames from the H.264 decoder are always tight-strided so this is safe
+      today, but `media::Encoder` is a public trait and a supervised recorder
+      must not abort the process on bad input. Validate plane lengths and
+      strides in `encode` and return `Error::Encode`.
+- [ ] **`Av1Encoder` is only tested at 16x16 with even dimensions.** Add cases
+      for odd width/height (chroma `div_ceil` and rav1e's padded plane stride)
+      and for at least one realistic resolution, so the plane copy is not
+      first exercised at 1080p by the job runner.
 - [ ] Define timestamp/time-base handling between decoded `Frame`s, encoded
       `Packet`s, and the WebM muxer.
 - [ ] Map encoder keyframes to WebM cluster/segment boundaries and make forced
@@ -229,26 +265,28 @@ needs, and only with differential proof.
 - [ ] Formatting, tests, strict Clippy, AV1 builds, and integration tests pass
       in CI from a clean checkout.
 
-## Current baseline (2026-08-26, re-validated)
+## Current baseline (2026-08-26, re-validated after commit d605277)
 
-Measured against this working tree, not carried forward from an earlier
+Measured against the committed tree, not carried forward from an earlier
 session:
 
-- `cargo test`: 200 lib tests + `h264_camera_regression` + `h264_robustness`,
+- `cargo fmt --check`: passes.
+- `cargo test`: 209 lib tests + `h264_camera_regression` + `h264_robustness`,
   all pass.
-- `cargo test --features reference-decoder`: 212 lib tests + 3 integration
-  tests, all pass — includes the 10 differential cases and the bit-exact
+- `cargo test --features reference-decoder`: 223 lib tests + 3 integration
+  tests, all pass, including the differential cases and the bit-exact
   camera-fixture lock.
-- `cargo clippy --all-targets -- -D warnings`: clean on default features and
-  on `--features reference-decoder`.
-- `cargo fmt --check`: **fails** (3 files; see the P0 gate item above).
-- `bench_h264 camera.h264` release: best 128.4 fps at 1920×1080
-  (7.79 ms/frame, 4.28× real time at 30 fps). Acceptance gate PASS at 2.14×
-  the 60 fps floor; the example now exits non-zero when it fails.
-- `diff_h264 camera.h264`: 224 pictures bit-exact (earlier session); the
-  4-picture equivalent is now locked in CI.
-- The working tree contains uncommitted H.264 decoder/test changes; keep them
-  intact while completing and validating this checklist.
+- `cargo test --features av1`: 215 lib tests + 2 integration tests, all pass;
+  the 4 `codec::av1` tests are among them.
+- `cargo clippy --all-targets -- -D warnings`: clean on default features, on
+  `--features reference-decoder`, and on `--features av1`.
+- `diff_h264 camera.h264`: 224 pictures bit-exact, divergence none — still
+  exact after `nal_ref_idc`, list reordering, weighted-prediction rejection
+  and MMCO landed.
+- `bench_h264 camera.h264` release: best 130.2 fps at 1920x1080
+  (7.68 ms/frame, 4.34x real time at 30 fps). Acceptance gate PASS at 2.17x
+  the 60 fps floor; the example exits non-zero when it fails.
+- No encode-side throughput number exists at 1080p. See the P1 gate item.
 
 ## Known scope limits that are correct, not bugs
 

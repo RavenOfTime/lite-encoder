@@ -150,6 +150,9 @@ pub fn parse_cabac(ctx: &Context, nal: &[u8]) -> Result<CabacSlice, Error> {
         }
     };
     reject_pred_weight_table(header_data.pred_weight_table.as_ref())?;
+    if header_data.redundant_pic_cnt.is_some_and(|count| count > 0) {
+        return Err(decode("redundant coded pictures are unsupported"));
+    }
     let list_mods = short_term_list_mods(&header_data.ref_pic_list_modification)?;
     let marking = ref_marking(&header_data.dec_ref_pic_marking)?;
     let slice_qp = (26 + pps.pic_init_qp_minus26 + header_data.slice_qp_delta)

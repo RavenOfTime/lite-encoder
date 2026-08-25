@@ -197,6 +197,9 @@ fn validate_sps(sps: &SeqParameterSet) -> Result<(), Error> {
     if !matches!(sps.frame_mbs_flags, FrameMbsFlags::Frames) {
         return Err(Error::Decode("interlaced pictures are unsupported".into()));
     }
+    if sps.gaps_in_frame_num_value_allowed_flag {
+        return Err(Error::Decode("frame number gaps are unsupported".into()));
+    }
     Ok(())
 }
 
@@ -206,6 +209,9 @@ fn validate_pps(pps: &PicParameterSet) -> Result<(), Error> {
     }
     if pps.weighted_pred_flag {
         return Err(Error::Decode("weighted P prediction is unsupported".into()));
+    }
+    if pps.redundant_pic_cnt_present_flag {
+        return Err(Error::Decode("redundant coded pictures are unsupported".into()));
     }
     Ok(())
 }
@@ -304,7 +310,7 @@ mod tests {
             .to_string()
             .contains("only 8-bit"));
 
-        let mut interlaced = sps;
+        let mut interlaced = sps.clone();
         interlaced.frame_mbs_flags = FrameMbsFlags::Fields {
             mb_adaptive_frame_field_flag: true,
         };
@@ -312,6 +318,13 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("interlaced"));
+
+        let mut gaps = sps;
+        gaps.gaps_in_frame_num_value_allowed_flag = true;
+        assert!(validate_sps(&gaps)
+            .unwrap_err()
+            .to_string()
+            .contains("frame number gaps"));
 
         pps.slice_groups = Some(h264_reader::nal::pps::SliceGroup::Dispersed {
             num_slice_groups_minus1: 1,
@@ -324,5 +337,12 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("weighted P prediction"));
+
+        let (_, mut redundant) = camera_parameter_sets();
+        redundant.redundant_pic_cnt_present_flag = true;
+        assert!(validate_pps(&redundant)
+            .unwrap_err()
+            .to_string()
+            .contains("redundant coded pictures"));
     }
 }
