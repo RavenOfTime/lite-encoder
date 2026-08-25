@@ -151,7 +151,10 @@ fn synthesize_with_options(
     slice_count: u32,
     cabac: bool,
 ) -> Result<SyntheticStream, Error> {
-    assert!(slice_count > 0, "an encoded picture needs at least one slice");
+    assert!(
+        slice_count > 0,
+        "an encoded picture needs at least one slice"
+    );
     let mut encoder = RawEncoder::new(width, height, keyframe_interval, slice_count, cabac)?;
     let mut annexb = Vec::new();
     for i in 0..frames {
@@ -189,7 +192,7 @@ impl RawEncoder {
         cabac: bool,
     ) -> Result<Self, Error> {
         use openh264_sys2::{
-            API, CAMERA_VIDEO_REAL_TIME, ISVCEncoder, SEncParamExt, PRO_HIGH, RC_OFF_MODE,
+            ISVCEncoder, SEncParamExt, API, CAMERA_VIDEO_REAL_TIME, PRO_HIGH, RC_OFF_MODE,
             SM_FIXEDSLCNUM_SLICE, SM_SINGLE_SLICE,
         };
 
@@ -251,7 +254,9 @@ impl RawEncoder {
             };
             if initialize(encoder, &raw const params) != 0 {
                 api.WelsDestroySVCEncoder(encoder);
-                return Err(Error::Encode("openh264: encoder rejected parameters".into()));
+                return Err(Error::Encode(
+                    "openh264: encoder rejected parameters".into(),
+                ));
             }
         }
         Ok(Self {

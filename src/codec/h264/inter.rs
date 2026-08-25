@@ -137,11 +137,7 @@ const MAX_ROWS: usize = (16 + MARGIN) * 16;
 fn gather(p: &Plane, x0: i32, y0: i32, pw: usize, ph: usize, out: &mut [u8]) {
     // The common case by far: the patch lies wholly inside the reference, so
     // no coordinate needs clamping and each row is one copy.
-    if x0 >= 0
-        && y0 >= 0
-        && (x0 as usize + pw) <= p.width
-        && (y0 as usize + ph) <= p.height
-    {
+    if x0 >= 0 && y0 >= 0 && (x0 as usize + pw) <= p.width && (y0 as usize + ph) <= p.height {
         for j in 0..ph {
             let start = (y0 as usize + j) * p.stride + x0 as usize;
             out[j * pw..(j + 1) * pw].copy_from_slice(&p.data[start..start + pw]);
@@ -160,11 +156,7 @@ fn gather(p: &Plane, x0: i32, y0: i32, pw: usize, ph: usize, out: &mut [u8]) {
 
 /// Copies a block of full samples, for the integer-vector case.
 fn copy_block(p: &Plane, x0: i32, y0: i32, bw: usize, bh: usize, out: &mut [u8]) {
-    if x0 >= 0
-        && y0 >= 0
-        && (x0 as usize + bw) <= p.width
-        && (y0 as usize + bh) <= p.height
-    {
+    if x0 >= 0 && y0 >= 0 && (x0 as usize + bw) <= p.width && (y0 as usize + bh) <= p.height {
         for j in 0..bh {
             let start = (y0 as usize + j) * p.stride + x0 as usize;
             out[j * bw..(j + 1) * bw].copy_from_slice(&p.data[start..start + bw]);
@@ -217,7 +209,14 @@ pub fn predict_luma(
 
     let (pw, ph) = (bw + MARGIN, bh + MARGIN);
     let mut patch = [0u8; MAX_PATCH];
-    gather(reference, base_x - 2, base_y - 2, pw, ph, &mut patch[..pw * ph]);
+    gather(
+        reference,
+        base_x - 2,
+        base_y - 2,
+        pw,
+        ph,
+        &mut patch[..pw * ph],
+    );
 
     // Patch coordinates of output sample `(i, j)`: the margin puts the full
     // sample `G` two rows down and two columns along.
@@ -308,16 +307,24 @@ pub fn predict_luma(
         // Diagonal quarter positions: average of the two adjacent half
         // positions, never involving the centre.
         (1, 1) => {
-            fill!(|i, j| (round_half(horizontal(j + 2, i)) + round_half(vertical(j, i + 2)) + 1) >> 1)
+            fill!(
+                |i, j| (round_half(horizontal(j + 2, i)) + round_half(vertical(j, i + 2)) + 1) >> 1
+            )
         }
         (3, 1) => {
-            fill!(|i, j| (round_half(horizontal(j + 2, i)) + round_half(vertical(j, i + 3)) + 1) >> 1)
+            fill!(
+                |i, j| (round_half(horizontal(j + 2, i)) + round_half(vertical(j, i + 3)) + 1) >> 1
+            )
         }
         (1, 3) => {
-            fill!(|i, j| (round_half(vertical(j, i + 2)) + round_half(horizontal(j + 3, i)) + 1) >> 1)
+            fill!(
+                |i, j| (round_half(vertical(j, i + 2)) + round_half(horizontal(j + 3, i)) + 1) >> 1
+            )
         }
         (3, 3) => {
-            fill!(|i, j| (round_half(vertical(j, i + 3)) + round_half(horizontal(j + 3, i)) + 1) >> 1)
+            fill!(
+                |i, j| (round_half(vertical(j, i + 3)) + round_half(horizontal(j + 3, i)) + 1) >> 1
+            )
         }
 
         _ => unreachable!("the integer position returned early"),

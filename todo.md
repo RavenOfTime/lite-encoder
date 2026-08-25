@@ -17,10 +17,7 @@ support come after that vertical slice works.
         both pass.
   - [x] `cargo clippy --all-targets -- -D warnings` clean on default features
         and on `--features reference-decoder`.
-  - [ ] `cargo fmt --check` still **fails**, in three files:
-        `src/codec/h264/decoder.rs` and `src/codec/h264/differential.rs` (new
-        test code in this working tree) plus `examples/diff_h264.rs`
-        (pre-existing). A single `cargo fmt` clears all three.
+  - [x] `cargo fmt --check` passes after formatting the working tree.
   - [ ] `cargo build --features av1` has not been run against this tree.
 - [x] Run the OpenH264 differential suite with `--features reference-decoder`.
 - [x] Run `diff_h264` over `camera.h264` and confirm every decoded sample still
@@ -73,30 +70,34 @@ support come after that vertical slice works.
 Found 2026-08-26 while validating the current tree. Each of these is parsed
 past and then ignored, so a stream that uses it decodes to **wrong pixels with
 no error** — precisely the failure mode the differential strategy exists to
-catch. The camera fixture happens to use none of them, so the bit-exact result
-does not cover them.
+catch. The Tapo camera fixture *does* emit `ref_pic_list_modification`
+(`Subtract(0)`) and adaptive MMCO on P slices; with `max_num_ref_frames == 1`
+those happen to match the default list / sliding window, which is why bit-exact
+checks passed while the syntax was ignored.
 
 Project doctrine is to refuse what is not implemented, at the parameter-set or
 slice-header stage, rather than half-implement it. Rejecting is the cheap fix
 and should land first; implement only what the target camera set actually
 needs, and only with differential proof.
 
-- [ ] **`nal_ref_idc == 0` is never read.** `PictureDecoder::finish`
-      unconditionally pushes every decoded picture into the DPB, so a
-      disposable (non-reference) picture becomes a reference and the sliding
-      window evicts a real one early. Cameras emitting temporal layers or
-      "smart" GOPs send these. Plumb `nal_ref_idc` from the NAL header through
-      `SliceInfo` and push only reference pictures.
-- [ ] **`ref_pic_list_modification` is ignored.** `Dpb` always hands out the
-      default descending-`PicNum` list. Reject slices carrying a modification,
-      or implement the reorder.
+- [x] **DONE (Codex): Honor `nal_ref_idc == 0`.** The NAL reference value is
+      preserved in `SliceInfo`; access units mixing values are rejected; and
+      disposable pictures are displayed then recycled without entering the
+      DPB or displacing a real reference.
+- [x] **DONE (Auto): Implement short-term `ref_pic_list_modification`.**
+      Commands are carried on `CabacSlice::list_mods`; `Dpb::list0` applies
+      spec 8.2.4.3.1 before inter prediction. Long-term modifications are
+      rejected. The camera fixture's `Subtract(0)` path is covered by unit
+      tests and still bit-exact on the regression fixture.
 - [ ] **`weighted_pred_flag` / `pred_weight_table` are ignored.** Weighted P
       slices receive unweighted prediction. Cameras enable this around IR-cut
       day/night transitions. Reject or implement.
-- [ ] **`dec_ref_pic_marking` MMCO operations and long-term references are
-      ignored.** Only the sliding window of 8.2.5.3 exists, and IDR
-      `long_term_reference_flag` / `no_output_of_prior_pics_flag` are dropped.
-      Reject adaptive marking, or implement it.
+- [ ] **PARTIAL:** **`dec_ref_pic_marking` MMCO operations and long-term
+      references are ignored.** Only the sliding window of 8.2.5.3 exists, and
+      IDR `long_term_reference_flag` / `no_output_of_prior_pics_flag` are
+      dropped. The Tapo fixture emits adaptive MMCO op 1 (mark previous unused)
+      which coincides with capacity-1 sliding-window eviction — still implement
+      or reject explicitly. Reject adaptive marking, or implement it.
 - [ ] **Redundant coded pictures are not discarded.** `redundant_pic_cnt` is
       never inspected, so a redundant slice would be decoded as ordinary
       picture data. Reject when `redundant_pic_cnt_present_flag` is set.

@@ -101,6 +101,11 @@ impl PictureDecoder {
                 .resize(slice_id as usize + 1, Deblocking::default());
         }
         self.deblocking[slice_id as usize] = slice.info.deblocking;
+        let refs = self.dpb.list0(
+            slice.info.frame_num,
+            &slice.list_mods,
+            slice.info.num_ref_idx_l0,
+        )?;
         let mut d = ArithDecoder::new_at_bit(&slice.data, slice.bit_offset as usize)
             .ok_or_else(|| Error::Decode("truncated CABAC slice".into()))?;
         let mut cx = ContextState::new(
@@ -116,12 +121,13 @@ impl PictureDecoder {
         let total = self.config.width_mbs * self.config.height_mbs;
         for addr in slice.info.first_mb..total {
             self.state.begin_macroblock(addr, slice_id);
-            let (info, residual) = self.decode_macroblock(&mut d, &mut cx, addr, qp, &slice.info)?;
+            let (info, residual) =
+                self.decode_macroblock(&mut d, &mut cx, addr, qp, &slice.info)?;
             qp = info.qp;
             recon::reconstruct(
                 &mut self.picture,
                 &self.state,
-                &self.dpb,
+                &refs,
                 addr,
                 &info,
                 &residual,
@@ -139,9 +145,10 @@ impl PictureDecoder {
         Ok(())
     }
 
-    /// Deblocks this picture, hands out the displayable frame, and makes the
-    /// picture usable as reference zero for a following P picture.  Call only
-    /// after every slice was decoded.
+    /// Deblocks this picture and hands out the displayable frame. Reference
+    /// pictures become reference zero for a following P picture; disposable
+    /// pictures are returned immediately for buffer reuse. Call only after
+    /// every slice was decoded.
     ///
     /// The filter runs here rather than per macroblock because it reads
     /// samples from the macroblocks below and to the right of the one it is
@@ -151,7 +158,7 @@ impl PictureDecoder {
     /// picture itself can then move into the DPB rather than being cloned into
     /// it. The order matters only for cost, not for correctness: both the
     /// frame and the reference are the deblocked picture.
-    pub fn finish(mut self, crop: Cropping, pts: Duration) -> Finished {
+    pub fn finish(mut self, crop: Cropping, pts: Duration, is_reference: bool) -> Finished {
         // Concealment before the filter: unclaimed macroblocks must not keep
         // whatever samples a recycled buffer held, and the filter already
         // skips them so greying first is order-independent for correctness
@@ -166,7 +173,11 @@ impl PictureDecoder {
             },
         );
         let frame = self.picture.to_frame(crop, pts);
-        let recycled = self.dpb.push(self.picture);
+        let recycled = if is_reference {
+            self.dpb.push(self.picture)
+        } else {
+            Some(self.picture)
+        };
         Finished {
             frame,
             dpb: self.dpb,
@@ -318,13 +329,7 @@ fn skip_mv(state: &PictureState, addr: MbAddr) -> (i32, i32) {
     // three neighbours of a 16x16 partition lie outside it.
     let (a, b, c) = partition_neighbours(state, addr, &MbInfo::skipped(), 0, 0, 16);
     let n = &state.neighbours;
-    inter::predict_skip_mv(
-        a,
-        b,
-        c,
-        n.mb_a(addr).is_some(),
-        n.mb_b(addr).is_some(),
-    )
+    inter::predict_skip_mv(a, b, c, n.mb_a(addr).is_some(), n.mb_b(addr).is_some())
 }
 
 /// Neighbours A, B and C of a partition, in the form vector prediction wants.
@@ -704,4 +709,42 @@ fn decode_cbf(
         syntax::cbf_category(block, matches!(info.mb_type, MbType::Intra16x16 { .. })),
         inc,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> PictureConfig {
+        PictureConfig {
+            width_mbs: 1,
+            height_mbs: 1,
+            max_refs: 1,
+            max_frame_num: 16,
+            crop: Cropping::default(),
+        }
+    }
+
+    #[test]
+    fn reference_picture_enters_the_dpb() {
+        let finished =
+            PictureDecoder::new(config()).finish(Cropping::default(), Duration::ZERO, true);
+        assert_eq!(finished.dpb.len(), 1);
+        assert!(finished.recycled.is_none());
+    }
+
+    #[test]
+    fn disposable_picture_is_recycled_without_displacing_a_reference() {
+        let mut decoder = PictureDecoder::new(config());
+        let mut reference = Picture::new(1, 1);
+        reference.frame_num = 7;
+        let _ = decoder.dpb.push(reference);
+        decoder.picture.frame_num = 8;
+
+        let finished = decoder.finish(Cropping::default(), Duration::ZERO, false);
+
+        assert_eq!(finished.dpb.len(), 1);
+        assert_eq!(finished.dpb.get(0).unwrap().frame_num, 7);
+        assert_eq!(finished.recycled.unwrap().frame_num, 8);
+    }
 }

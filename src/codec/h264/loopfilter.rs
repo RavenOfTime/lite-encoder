@@ -208,11 +208,7 @@ fn edge_strengths(
                 luma_4x4_index(group * 4, e * 4),
             ),
         };
-        *strength = boundary_strength(
-            edge_block(neighbour, p_blk),
-            edge_block(cur, q_blk),
-            e == 0,
-        );
+        *strength = boundary_strength(edge_block(neighbour, p_blk), edge_block(cur, q_blk), e == 0);
     }
     bs
 }

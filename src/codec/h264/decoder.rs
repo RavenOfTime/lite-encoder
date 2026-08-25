@@ -103,10 +103,17 @@ impl Frontend {
             return Ok(Vec::new());
         };
         let config = first.info.picture;
+        let nal_ref_idc = first.info.nal_ref_idc;
         if slices.iter().any(|slice| slice.info.picture != config) {
             return Err(Error::Decode(
                 "access unit mixes picture configurations".into(),
             ));
+        }
+        if slices
+            .iter()
+            .any(|slice| slice.info.nal_ref_idc != nal_ref_idc)
+        {
+            return Err(Error::Decode("access unit mixes nal_ref_idc values".into()));
         }
         if self.config != Some(config) {
             self.spare.clear();
@@ -133,7 +140,7 @@ impl Frontend {
         for (slice_id, slice) in slices.iter().enumerate() {
             picture.decode_slice(slice, slice_id as u32)?;
         }
-        let finished = picture.finish(config.crop, pts);
+        let finished = picture.finish(config.crop, pts, nal_ref_idc != 0);
         self.dpb = Some(finished.dpb);
         self.state = Some(finished.state);
         self.spare.extend(finished.recycled);
@@ -193,7 +200,8 @@ fn validate_pps(pps: &PicParameterSet) -> Result<(), Error> {
 mod tests {
     use super::*;
 
-    const CAMERA_FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/tapo-1080p-cabac-8x8.h264");
+    const CAMERA_FIXTURE: &[u8] =
+        include_bytes!("../../../tests/fixtures/tapo-1080p-cabac-8x8.h264");
 
     fn camera_parameter_sets() -> (SeqParameterSet, PicParameterSet) {
         let sps_bytes = annexb::nal_units(CAMERA_FIXTURE)
@@ -208,7 +216,8 @@ mod tests {
         let pps_nal = RefNal::new(pps_bytes, &[], true);
         let mut context = Context::default();
         context.put_seq_param_set(sps.clone());
-        let pps = PicParameterSet::from_bits(&context, pps_nal.rbsp_bits()).expect("fixture PPS invalid");
+        let pps =
+            PicParameterSet::from_bits(&context, pps_nal.rbsp_bits()).expect("fixture PPS invalid");
         (sps, pps)
     }
 
@@ -227,12 +236,34 @@ mod tests {
     }
 
     #[test]
+    fn slice_info_preserves_nal_ref_idc() {
+        let mut frontend = Frontend::new();
+        for access_unit in annexb::access_units(CAMERA_FIXTURE) {
+            let expected = annexb::nal_units(access_unit)
+                .find(|nal| {
+                    nal.first()
+                        .is_some_and(|header| header & 0x1f == 1 || header & 0x1f == 5)
+                })
+                .map(|nal| (nal[0] & 0x60) >> 5);
+            let slices = frontend.parse_access_unit(access_unit).unwrap();
+            if let Some(expected) = expected {
+                assert!(!slices.is_empty());
+                assert!(slices
+                    .iter()
+                    .all(|slice| slice.info.nal_ref_idc == expected));
+            }
+        }
+    }
+
+    #[test]
     fn unsupported_slice_partitions_and_extensions_are_rejected() {
         for nal_type in [2, 3, 4, 13, 14, 15, 16, 19, 20, 21, 22, 24] {
             let mut frontend = Frontend::new();
             let access_unit = [0, 0, 1, nal_type, 0x80];
             let error = frontend.parse_access_unit(&access_unit).unwrap_err();
-            assert!(error.to_string().contains("unsupported H.264 NAL unit type"));
+            assert!(error
+                .to_string()
+                .contains("unsupported H.264 NAL unit type"));
         }
     }
 
@@ -240,7 +271,11 @@ mod tests {
     fn unsupported_sps_and_pps_features_are_rejected() {
         let (sps, mut pps) = camera_parameter_sets();
 
-        for chroma in [ChromaFormat::Monochrome, ChromaFormat::YUV422, ChromaFormat::YUV444] {
+        for chroma in [
+            ChromaFormat::Monochrome,
+            ChromaFormat::YUV422,
+            ChromaFormat::YUV444,
+        ] {
             let mut unsupported = sps.clone();
             unsupported.chroma_info.chroma_format = chroma;
             assert!(validate_sps(&unsupported)

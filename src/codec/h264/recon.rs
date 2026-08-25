@@ -27,7 +27,7 @@
 use super::intra::{self, Intra16x16Mode, IntraChromaMode, IntraNxNMode, Neighbours};
 use super::mb::{self, MbType};
 use super::neighbour::{luma_4x4_index, luma_4x4_origin, luma_8x8_origin, MbAddr};
-use super::picture::{Dpb, Picture};
+use super::picture::Picture;
 use super::residual::{ZIGZAG_4X4, ZIGZAG_8X8};
 use super::state::{MbInfo, PictureState};
 use super::transform;
@@ -156,7 +156,10 @@ impl ScalingLists {
     /// slots it leaves absent.
     pub fn from_syntax(
         sps: Option<(&[ScalingListSyntax<16>; 6], &[ScalingListSyntax<64>; 2])>,
-        pps: Option<(&[ScalingListSyntax<16>; 6], Option<&[ScalingListSyntax<64>; 2]>)>,
+        pps: Option<(
+            &[ScalingListSyntax<16>; 6],
+            Option<&[ScalingListSyntax<64>; 2]>,
+        )>,
     ) -> Self {
         let defaults = Self::default_matrices();
         let sps_lists = sps.map(|(a, b)| Self::resolve(a, b, &defaults));
@@ -254,7 +257,7 @@ impl Default for Residual {
 pub fn reconstruct(
     picture: &mut Picture,
     state: &PictureState,
-    dpb: &Dpb,
+    refs: &[&Picture],
     addr: MbAddr,
     info: &MbInfo,
     residual: &Residual,
@@ -263,10 +266,10 @@ pub fn reconstruct(
     if info.is_intra() {
         predict_intra_luma(picture, state, addr, info, residual, params)?;
     } else {
-        predict_inter(picture, dpb, state, addr, info)?;
+        predict_inter(picture, refs, state, addr, info)?;
         add_luma_residual(picture, state, addr, info, residual, params);
     }
-    reconstruct_chroma(picture, state, dpb, addr, info, residual, params)?;
+    reconstruct_chroma(picture, state, refs, addr, info, residual, params)?;
     Ok(())
 }
 
@@ -287,7 +290,9 @@ fn predict_intra_luma(
             let mut pred = [0u8; 256];
             let mut top = [0u8; 32];
             let mut left = [0u8; 16];
-            let n = gather_luma_neighbours(picture, state, addr, 0, 0, 16, 16, params, &mut top, &mut left);
+            let n = gather_luma_neighbours(
+                picture, state, addr, 0, 0, 16, 16, params, &mut top, &mut left,
+            );
             if !intra::predict_16x16(mode, &n, &mut pred) {
                 return Err(unavailable(mode));
             }
@@ -301,8 +306,18 @@ fn predict_intra_luma(
                 let mut pred = [0u8; 64];
                 let mut top = [0u8; 32];
                 let mut left = [0u8; 16];
-                let n =
-                    gather_luma_neighbours(picture, state, addr, bx, by, 8, blk * 4, params, &mut top, &mut left);
+                let n = gather_luma_neighbours(
+                    picture,
+                    state,
+                    addr,
+                    bx,
+                    by,
+                    8,
+                    blk * 4,
+                    params,
+                    &mut top,
+                    &mut left,
+                );
                 if !intra::predict_8x8(mode, &n, &mut pred) {
                     return Err(unavailable(mode));
                 }
@@ -313,7 +328,12 @@ fn predict_intra_luma(
                     transform::dequant_8x8(&mut block, info.qp, params.scaling.list_8x8(true));
                     transform::inverse_8x8(&mut block);
                     let offset = (mb_y + by) * picture.strides[0] + mb_x + bx;
-                    transform::add_residual_8x8(&mut picture.planes[0], offset, picture.strides[0], &block);
+                    transform::add_residual_8x8(
+                        &mut picture.planes[0],
+                        offset,
+                        picture.strides[0],
+                        &block,
+                    );
                 }
             }
         }
@@ -324,7 +344,9 @@ fn predict_intra_luma(
                 let mut pred = [0u8; 16];
                 let mut top = [0u8; 32];
                 let mut left = [0u8; 16];
-                let n = gather_luma_neighbours(picture, state, addr, bx, by, 4, blk, params, &mut top, &mut left);
+                let n = gather_luma_neighbours(
+                    picture, state, addr, bx, by, 4, blk, params, &mut top, &mut left,
+                );
                 if !intra::predict_4x4(mode, &n, &mut pred) {
                     return Err(unavailable(mode));
                 }
@@ -332,10 +354,20 @@ fn predict_intra_luma(
 
                 if info.luma_cbf(blk) {
                     let mut block = dezigzag_4x4(&residual.luma[blk as usize]);
-                    transform::dequant_4x4(&mut block, info.qp, params.scaling.list_4x4(true, 0), false);
+                    transform::dequant_4x4(
+                        &mut block,
+                        info.qp,
+                        params.scaling.list_4x4(true, 0),
+                        false,
+                    );
                     transform::inverse_4x4(&mut block);
                     let offset = (mb_y + by) * picture.strides[0] + mb_x + bx;
-                    transform::add_residual_4x4(&mut picture.planes[0], offset, picture.strides[0], &block);
+                    transform::add_residual_4x4(
+                        &mut picture.planes[0],
+                        offset,
+                        picture.strides[0],
+                        &block,
+                    );
                 }
             }
         }
@@ -393,7 +425,7 @@ fn dc_index(blk: u8) -> usize {
 
 fn predict_inter(
     picture: &mut Picture,
-    dpb: &Dpb,
+    refs: &[&Picture],
     state: &PictureState,
     addr: MbAddr,
     info: &MbInfo,
@@ -406,7 +438,7 @@ fn predict_inter(
     for blk in 0..16u8 {
         let (bx, by) = luma_4x4_origin(blk);
         let ref_idx = info.ref_idx_of_block(blk);
-        let reference = dpb.get(ref_idx.max(0) as usize).ok_or_else(|| {
+        let reference = refs.get(ref_idx.max(0) as usize).copied().ok_or_else(|| {
             Error::Decode(format!(
                 "macroblock {addr} references picture {ref_idx}, which is not in the buffer"
             ))
@@ -467,7 +499,12 @@ fn add_luma_residual(
         }
         let (bx, by) = luma_4x4_origin(blk);
         let mut block = dezigzag_4x4(&residual.luma[blk as usize]);
-        transform::dequant_4x4(&mut block, info.qp, params.scaling.list_4x4(false, 0), false);
+        transform::dequant_4x4(
+            &mut block,
+            info.qp,
+            params.scaling.list_4x4(false, 0),
+            false,
+        );
         transform::inverse_4x4(&mut block);
         transform::add_residual_4x4(
             &mut picture.planes[0],
@@ -483,7 +520,7 @@ fn add_luma_residual(
 fn reconstruct_chroma(
     picture: &mut Picture,
     state: &PictureState,
-    dpb: &Dpb,
+    refs: &[&Picture],
     addr: MbAddr,
     info: &MbInfo,
     residual: &Residual,
@@ -505,7 +542,8 @@ fn reconstruct_chroma(
             let mut pred = [0u8; 64];
             let mut top = [0u8; 32];
             let mut left = [0u8; 16];
-            let n = gather_chroma_neighbours(picture, state, addr, plane, params, &mut top, &mut left);
+            let n =
+                gather_chroma_neighbours(picture, state, addr, plane, params, &mut top, &mut left);
             if !intra::predict_chroma_8x8(mode, &n, &mut pred) {
                 return Err(Error::Decode(format!(
                     "chroma mode {mode:?} needs neighbours that macroblock {addr} does not have"
@@ -519,7 +557,7 @@ fn reconstruct_chroma(
                 // luma block of this 4x4 chroma block is its 8x8 quadrant.
                 let luma_blk = luma_4x4_index(bx * 2, by * 2);
                 let ref_idx = info.ref_idx_of_block(luma_blk);
-                let reference = dpb.get(ref_idx.max(0) as usize).ok_or_else(|| {
+                let reference = refs.get(ref_idx.max(0) as usize).copied().ok_or_else(|| {
                     Error::Decode(format!("macroblock {addr} references picture {ref_idx}"))
                 })?;
                 let mv = (
@@ -752,7 +790,8 @@ fn dezigzag_8x8(levels: &[i32; 64]) -> [i32; 64] {
 }
 
 fn nxn_mode(id: u8) -> Result<IntraNxNMode, Error> {
-    IntraNxNMode::from_id(id).ok_or_else(|| Error::Decode(format!("intra mode {id} is not defined")))
+    IntraNxNMode::from_id(id)
+        .ok_or_else(|| Error::Decode(format!("intra mode {id} is not defined")))
 }
 
 fn unavailable(mode: impl std::fmt::Debug) -> Error {
@@ -766,8 +805,9 @@ const _: fn(Intra16x16Mode) -> Error = unavailable;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::mb::Partitioning;
+    use super::super::picture::Dpb;
+    use super::*;
 
     fn params() -> ReconParams {
         ReconParams {
@@ -798,7 +838,10 @@ mod tests {
         assert_eq!(ac[1], 2);
 
         let levels: [i32; 64] = std::array::from_fn(|i| i as i32 + 1);
-        assert_eq!(dezigzag_8x8(&levels).iter().filter(|&&v| v != 0).count(), 64);
+        assert_eq!(
+            dezigzag_8x8(&levels).iter().filter(|&&v| v != 0).count(),
+            64
+        );
     }
 
     /// The DC array is a raster of blocks while the blocks themselves are
@@ -836,11 +879,10 @@ mod tests {
             },
             26,
         );
-        let dpb = Dpb::new(1, 16);
         reconstruct(
             &mut picture,
             &state,
-            &dpb,
+            &[],
             0,
             &info,
             &Residual::default(),
@@ -873,11 +915,10 @@ mod tests {
             },
             26,
         );
-        let dpb = Dpb::new(1, 16);
         let err = reconstruct(
             &mut picture,
             &state,
-            &dpb,
+            &[],
             0,
             &info,
             &Residual::default(),
@@ -898,6 +939,7 @@ mod tests {
         }
         let mut dpb = Dpb::new(1, 16);
         let _ = dpb.push(reference.clone());
+        let refs = dpb.list0(1, &[], 1).unwrap();
 
         let mut picture = Picture::new(2, 2);
         let mut state = PictureState::new(2, 2);
@@ -907,7 +949,7 @@ mod tests {
         reconstruct(
             &mut picture,
             &state,
-            &dpb,
+            &refs,
             1,
             &info,
             &Residual::default(),
@@ -934,13 +976,12 @@ mod tests {
         let mut picture = Picture::new(2, 2);
         let mut state = PictureState::new(2, 2);
         state.begin_macroblock(0, 0);
-        let dpb = Dpb::new(1, 16);
         let info = MbInfo::new(MbType::Inter(Partitioning::P16x16), 26);
 
         let err = reconstruct(
             &mut picture,
             &state,
-            &dpb,
+            &[],
             0,
             &info,
             &Residual::default(),
@@ -995,7 +1036,8 @@ mod tests {
         }
         let lists_4x4 = [ScalingListSyntax::Scan(scan); 6];
         let lists_8x8 = [ScalingListSyntax::NotPresent; 2];
-        let lists = ScalingLists::resolve(&lists_4x4, &lists_8x8, &ScalingLists::default_matrices());
+        let lists =
+            ScalingLists::resolve(&lists_4x4, &lists_8x8, &ScalingLists::default_matrices());
         // Scan index 2 lands at raster 4 (Table 8-13).
         assert_eq!(lists.weight_4x4[0][4], 3);
         assert_eq!(lists.weight_4x4[0][0], 1);

@@ -196,12 +196,27 @@ impl Cropping {
     }
 }
 
+/// A short-term `ref_pic_list_modification` command (spec 7.4.3.1).
+///
+/// Long-term commands are rejected at parse time; this decoder has no
+/// long-term reference support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefListMod {
+    /// `modification_of_pic_nums_idc == 0`: predicted PicNum minus
+    /// (`abs_diff_pic_num_minus1` + 1).
+    Subtract(u32),
+    /// `modification_of_pic_nums_idc == 1`: predicted PicNum plus
+    /// (`abs_diff_pic_num_minus1` + 1).
+    Add(u32),
+}
+
 /// The short-term reference pictures available for prediction.
 ///
 /// Ordered most-recent-first, which for a P slice with no reference list
 /// modification is exactly the list the spec derives: descending `PicNum`.
 /// Reference index 0 is therefore the previous picture, which in surveillance
-/// footage is what essentially every macroblock uses.
+/// footage is what essentially every macroblock uses. When the slice header
+/// carries modifications, [`Dpb::list0`] applies them before prediction.
 #[derive(Debug, Clone)]
 pub struct Dpb {
     refs: Vec<Picture>,
@@ -239,9 +254,96 @@ impl Dpb {
         self.refs.len()
     }
 
-    /// The reference picture at index `idx` of list 0.
+    /// The reference picture at index `idx` of the default list 0 order.
     pub fn get(&self, idx: usize) -> Option<&Picture> {
         self.refs.get(idx)
+    }
+
+    /// Builds reference list 0 for the current picture (spec 8.2.4).
+    ///
+    /// Starts from the default descending-`PicNum` order already stored in
+    /// `refs`, applies any short-term modifications, then truncates to
+    /// `num_active` entries (`num_ref_idx_l0_active_minus1 + 1`).
+    pub fn list0(
+        &self,
+        curr_pic_num: u16,
+        mods: &[RefListMod],
+        num_active: usize,
+    ) -> Result<Vec<&Picture>, crate::Error> {
+        let num_active = num_active.max(1);
+        let mut list: Vec<Option<&Picture>> = self.refs.iter().map(Some).collect();
+        list.resize(num_active + 1, None);
+
+        if !mods.is_empty() {
+            let max_pic_num = i64::from(self.max_frame_num);
+            let curr = i64::from(curr_pic_num);
+            let mut pred = curr;
+            for (ref_idx, command) in mods.iter().enumerate() {
+                let abs_diff = match *command {
+                    RefListMod::Subtract(v) | RefListMod::Add(v) => i64::from(v) + 1,
+                };
+                let no_wrap = match *command {
+                    RefListMod::Subtract(_) => {
+                        if pred - abs_diff < 0 {
+                            pred - abs_diff + max_pic_num
+                        } else {
+                            pred - abs_diff
+                        }
+                    }
+                    RefListMod::Add(_) => {
+                        if pred + abs_diff >= max_pic_num {
+                            pred + abs_diff - max_pic_num
+                        } else {
+                            pred + abs_diff
+                        }
+                    }
+                };
+                pred = no_wrap;
+                let pic_num = if no_wrap > curr {
+                    no_wrap - max_pic_num
+                } else {
+                    no_wrap
+                };
+                let picture = self
+                    .refs
+                    .iter()
+                    .find(|p| pic_num_of(p.frame_num, curr_pic_num, self.max_frame_num) == pic_num)
+                    .ok_or_else(|| {
+                        crate::Error::Decode(format!(
+                            "ref_pic_list_modification targets missing PicNum {pic_num}"
+                        ))
+                    })?;
+                // Spec 8.2.4.3.1: shift right from ref_idx, insert, then
+                // compact so the inserted PicNum is not duplicated.
+                for c_idx in (ref_idx + 1..=num_active).rev() {
+                    list[c_idx] = list[c_idx - 1];
+                }
+                list[ref_idx] = Some(picture);
+                let mut n_idx = ref_idx + 1;
+                for c_idx in ref_idx + 1..=num_active {
+                    let keep = list[c_idx].is_some_and(|p| {
+                        pic_num_of(p.frame_num, curr_pic_num, self.max_frame_num) != pic_num
+                    });
+                    if keep {
+                        list[n_idx] = list[c_idx];
+                        n_idx += 1;
+                    }
+                }
+                while n_idx <= num_active {
+                    list[n_idx] = None;
+                    n_idx += 1;
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(num_active);
+        for entry in list.into_iter().take(num_active) {
+            match entry {
+                Some(picture) => out.push(picture),
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     /// Adds a picture as the most recent reference, dropping the oldest if
@@ -278,6 +380,11 @@ impl Dpb {
 /// Spec `FrameNumWrap`: a picture's `frame_num` expressed relative to the
 /// current one, so that ordering survives the counter wrapping.
 fn frame_num_wrap(frame_num: u16, current: u16, max_frame_num: u32) -> i64 {
+    pic_num_of(frame_num, current, max_frame_num)
+}
+
+/// Spec `PicNum` for a short-term frame reference (equals `FrameNumWrap`).
+fn pic_num_of(frame_num: u16, current: u16, max_frame_num: u32) -> i64 {
     let (frame_num, current) = (i64::from(frame_num), i64::from(current));
     if frame_num > current {
         frame_num - i64::from(max_frame_num)
@@ -391,6 +498,23 @@ mod tests {
         assert_eq!(dpb.get(0).unwrap().frame_num, 2);
         assert_eq!(dpb.get(1).unwrap().frame_num, 1);
         assert_eq!(dpb.len(), 2);
+    }
+
+    #[test]
+    fn list0_subtract_reorders_short_term_references() {
+        let mut dpb = Dpb::new(4, 16);
+        let _ = dpb.push(picture_numbered(1));
+        let _ = dpb.push(picture_numbered(2));
+        let _ = dpb.push(picture_numbered(3));
+        // Default L0 for curr=4 is [3, 2, 1]. Subtract(1) selects PicNum 2
+        // (curr - 2) for index 0, leaving [2, 3, 1].
+        let list = dpb
+            .list0(4, &[RefListMod::Subtract(1)], 3)
+            .expect("list0");
+        assert_eq!(
+            list.iter().map(|p| p.frame_num).collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
     }
 
     #[test]

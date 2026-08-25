@@ -6,7 +6,9 @@
 //! `h264-reader` own every slice-header grammar detail.
 
 use h264_reader::nal::pps::{PicParameterSet, PicScalingMatrix};
-use h264_reader::nal::slice::{NumRefIdxActive, SliceFamily, SliceHeader};
+use h264_reader::nal::slice::{
+    ModificationOfPicNums, NumRefIdxActive, RefPicListModifications, SliceFamily, SliceHeader,
+};
 use h264_reader::nal::sps::{FrameMbsFlags, ScalingList, SeqParameterSet, SeqScalingMatrix};
 use h264_reader::nal::{NalHeader, UnitType};
 use h264_reader::rbsp::{self, BitRead, BitReaderError, Numeric, Primitive};
@@ -14,7 +16,7 @@ use h264_reader::Context;
 
 use crate::Error;
 
-use super::picture::Cropping;
+use super::picture::{Cropping, RefListMod};
 use super::recon::{ScalingListSyntax, ScalingLists};
 
 /// Header details consumed by the macroblock layer.
@@ -24,6 +26,9 @@ pub struct SliceInfo {
     pub frame_num: u16,
     pub kind: SliceKind,
     pub idr: bool,
+    /// NAL header `nal_ref_idc`. Zero marks a disposable picture that must
+    /// be displayed but must not enter the decoded picture buffer.
+    pub nal_ref_idc: u8,
     pub slice_qp: u8,
     /// `cabac_init_idc` for P slices. I slices always use table 0.
     pub cabac_init_idc: u8,
@@ -90,6 +95,9 @@ pub struct CabacSlice {
     /// header stays `Copy` while still updating when a new PPS arrives with
     /// the same picture size.
     pub scaling: ScalingLists,
+    /// Short-term `ref_pic_list_modification` commands for list 0. Empty when
+    /// the slice uses the default descending-`PicNum` order.
+    pub list_mods: Vec<RefListMod>,
     /// RBSP bytes holding CABAC data. `bit_offset` identifies its first bit.
     pub data: Vec<u8>,
     pub bit_offset: u8,
@@ -137,6 +145,7 @@ pub fn parse_cabac(ctx: &Context, nal: &[u8]) -> Result<CabacSlice, Error> {
             return Err(decode("SP/SI slices are outside decoder scope"))
         }
     };
+    let list_mods = short_term_list_mods(&header_data.ref_pic_list_modification)?;
     let slice_qp = (26 + pps.pic_init_qp_minus26 + header_data.slice_qp_delta)
         .try_into()
         .map_err(|_| decode("slice quantiser outside 0..=51"))?;
@@ -188,6 +197,7 @@ pub fn parse_cabac(ctx: &Context, nal: &[u8]) -> Result<CabacSlice, Error> {
             frame_num: header_data.frame_num,
             kind,
             idr,
+            nal_ref_idc: header.nal_ref_idc(),
             slice_qp,
             cabac_init_idc: cabac_init_idc as u8,
             picture: PictureConfig {
@@ -207,6 +217,7 @@ pub fn parse_cabac(ctx: &Context, nal: &[u8]) -> Result<CabacSlice, Error> {
             num_ref_idx_l0,
         },
         scaling: scaling_lists(sps, pps),
+        list_mods,
         data: rbsp[cabac_start / 8..].to_vec(),
         bit_offset: (cabac_start % 8) as u8,
     })
@@ -303,6 +314,36 @@ fn skip_cabac_alignment(rbsp: &[u8], header_end: usize) -> Result<usize, Error> 
         }
     }
     Ok(header_end + padding)
+}
+
+/// Collects short-term L0 modifications; rejects long-term reordering.
+fn short_term_list_mods(
+    mods: &Option<RefPicListModifications>,
+) -> Result<Vec<RefListMod>, Error> {
+    let commands = match mods {
+        Some(RefPicListModifications::P {
+            ref_pic_list_modification_l0,
+        }) => ref_pic_list_modification_l0.as_slice(),
+        Some(RefPicListModifications::B { .. }) => {
+            return Err(decode(
+                "B-slice ref_pic_list_modification is outside decoder scope",
+            ))
+        }
+        Some(RefPicListModifications::I) | None => return Ok(Vec::new()),
+    };
+    let mut out = Vec::with_capacity(commands.len());
+    for command in commands {
+        match command {
+            ModificationOfPicNums::Subtract(v) => out.push(RefListMod::Subtract(*v)),
+            ModificationOfPicNums::Add(v) => out.push(RefListMod::Add(*v)),
+            ModificationOfPicNums::LongTermRef(_) => {
+                return Err(decode(
+                    "long-term ref_pic_list_modification is outside decoder scope",
+                ))
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn nal_header(nal: &[u8]) -> Result<NalHeader, Error> {
@@ -421,6 +462,12 @@ impl<R: BitRead> BitRead for CountingBits<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use h264_reader::nal::pps::PicParameterSet;
+    use h264_reader::nal::sps::SeqParameterSet;
+    use h264_reader::nal::{Nal, RefNal};
+
+    const CAMERA_FIXTURE: &[u8] =
+        include_bytes!("../../../tests/fixtures/tapo-1080p-cabac-8x8.h264");
 
     #[test]
     fn counts_all_exp_golomb_bits_not_only_its_value() {
@@ -439,5 +486,38 @@ mod tests {
             32
         );
         assert!(skip_cabac_alignment(&[0, 0, 0, 0b0011_1011], 29).is_err());
+    }
+
+    #[test]
+    fn camera_style_ref_pic_list_modification_is_parsed() {
+        // Hand-built non-IDR P slice against the camera fixture's SPS/PPS.
+        // Header sets `ref_pic_list_modification_flag_l0` and one Subtract(0)
+        // command — the same spelling the Tapo stream uses.
+        let sps_bytes = super::super::annexb::nal_units(CAMERA_FIXTURE)
+            .find(|nal| nal.first().is_some_and(|h| h & 0x1f == 7))
+            .expect("fixture SPS");
+        let pps_bytes = super::super::annexb::nal_units(CAMERA_FIXTURE)
+            .find(|nal| nal.first().is_some_and(|h| h & 0x1f == 8))
+            .expect("fixture PPS");
+        let mut ctx = Context::default();
+        let sps =
+            SeqParameterSet::from_bits(RefNal::new(sps_bytes, &[], true).rbsp_bits()).expect("SPS");
+        ctx.put_seq_param_set(sps);
+        let pps = PicParameterSet::from_bits(&ctx, RefNal::new(pps_bytes, &[], true).rbsp_bits())
+            .expect("PPS");
+        ctx.put_pic_param_set(pps);
+
+        let nal = [0x21, 0xe2, 0x27, 0x23, 0x5f, 0xff];
+        let slice = parse_cabac(&ctx, &nal).expect("parse");
+        assert_eq!(slice.list_mods, [RefListMod::Subtract(0)]);
+    }
+
+    #[test]
+    fn long_term_ref_pic_list_modification_is_rejected() {
+        let modified = Some(RefPicListModifications::P {
+            ref_pic_list_modification_l0: vec![ModificationOfPicNums::LongTermRef(0)],
+        });
+        let err = short_term_list_mods(&modified).unwrap_err();
+        assert!(err.to_string().contains("long-term"));
     }
 }

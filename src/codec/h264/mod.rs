@@ -56,10 +56,10 @@ pub mod decoder;
 pub mod differential;
 pub mod inter;
 pub mod intra;
+pub mod loopfilter;
 pub mod mb;
 pub mod neighbour;
 pub mod picture;
-pub mod loopfilter;
 pub mod picture_decode;
 pub mod recon;
 #[cfg(feature = "reference-decoder")]

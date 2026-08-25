@@ -55,8 +55,8 @@ fn camera_fixture_decodes_exactly_four_1080p_pictures() {
 #[cfg(feature = "reference-decoder")]
 #[test]
 fn camera_fixture_matches_openh264_bit_exactly() {
-    use lite_encoder::codec::h264::differential;
     use lite_encoder::codec::h264::decoder::Frontend;
+    use lite_encoder::codec::h264::differential;
 
     let mut subject = Frontend::new();
     let report = differential::compare(CAMERA_FIXTURE, &mut subject).expect("compare");

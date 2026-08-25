@@ -300,7 +300,11 @@ impl PictureState {
         let Some(block) = block else {
             return super::inter::Neighbour::UNAVAILABLE;
         };
-        let info = if block.mb == curr { cur } else { self.at(block) };
+        let info = if block.mb == curr {
+            cur
+        } else {
+            self.at(block)
+        };
         if info.is_intra() {
             return super::inter::Neighbour::UNAVAILABLE;
         }

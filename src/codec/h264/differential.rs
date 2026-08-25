@@ -263,7 +263,9 @@ mod tests {
         let stream = synthesize_cavlc(64, 48, 1, 1).expect("encode");
         let access_unit = annexb::access_units(&stream.annexb)[0];
         let error = Frontend::new().parse_access_unit(access_unit).unwrap_err();
-        assert!(error.to_string().contains("CAVLC slice; CABAC decoder required"));
+        assert!(error
+            .to_string()
+            .contains("CAVLC slice; CABAC decoder required"));
     }
 
     /// Sizes that are not a whole number of macroblocks, and pictures wide
@@ -303,8 +305,14 @@ mod tests {
             .expect("camera fixture missing; see tests/fixtures/README.md");
         let mut subject = Frontend::new();
         let report = compare(&stream, &mut subject).expect("compare");
-        assert_eq!(report.reference_frames, 4, "camera fixture picture count changed");
-        assert_eq!(report.subject_frames, 4, "subject emitted the wrong picture count");
+        assert_eq!(
+            report.reference_frames, 4,
+            "camera fixture picture count changed"
+        );
+        assert_eq!(
+            report.subject_frames, 4,
+            "subject emitted the wrong picture count"
+        );
         assert!(report.matches(), "{report}");
         assert_eq!(report.to_string(), "4 frames match exactly");
     }
@@ -329,9 +337,10 @@ mod tests {
 
         // Reaching `parse_cabac` at all means `entropy_coding_mode_flag` was
         // set; it rejects CAVLC outright.
-        let idr = annexb::nal_units(units[0])
-            .any(|n| RefNal::new(n, &[], true).header().unwrap().nal_unit_type()
-                == UnitType::SliceLayerWithoutPartitioningIdr);
+        let idr = annexb::nal_units(units[0]).any(|n| {
+            RefNal::new(n, &[], true).header().unwrap().nal_unit_type()
+                == UnitType::SliceLayerWithoutPartitioningIdr
+        });
         assert!(idr, "fixture does not start with an IDR");
     }
 
