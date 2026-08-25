@@ -248,6 +248,30 @@ impl Neighbourhood {
         self.luma_4x4_neighbour(curr, blk, -1, -1)
     }
 
+    /// Spec 6.4.11.7: a neighbouring 4x4 block of a *partition*.
+    ///
+    /// Motion vector prediction asks for the neighbours of a partition, which
+    /// is not the same question as the neighbours of its top-left 4x4 block.
+    /// A and B coincide either way, but C sits at `(x + width, y - 1)`: for a
+    /// 16x16 partition that is the macroblock above and to the right, whereas
+    /// [`Self::luma_4x4_c`] would name a block inside the macroblock directly
+    /// above. Using the wrong one predicts from the wrong vector, which
+    /// decodes to a wrong picture without any error to notice it by.
+    ///
+    /// `x` and `y` locate the partition within the current macroblock.
+    pub fn luma_partition_neighbour(
+        &self,
+        curr: MbAddr,
+        x: usize,
+        y: usize,
+        dx: i32,
+        dy: i32,
+    ) -> Option<BlockRef> {
+        let at = self.luma_location(curr, x as i32 + dx, y as i32 + dy)?;
+        let found = luma_4x4_index(at.x, at.y);
+        self.decoded_before(at.mb, found, curr, luma_4x4_index(x, y))
+    }
+
     /// Spec 6.4.11.2, for the 8x8 luma blocks the transform-size-8x8 path and
     /// the coded block pattern work in.
     pub fn luma_8x8_neighbour(&self, curr: MbAddr, blk: u8, dx: i32, dy: i32) -> Option<BlockRef> {

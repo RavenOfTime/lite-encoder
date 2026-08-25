@@ -354,12 +354,27 @@ pub fn predict_mv(
 /// Skip is the common case in surveillance footage — most of the frame does
 /// not move — so this path carries far more macroblocks than the rest of the
 /// module combined.
-pub fn predict_skip_mv(a: Neighbour, b: Neighbour, c: Neighbour) -> (i32, i32) {
+///
+/// `a_present` and `b_present` say whether the left and above *macroblocks*
+/// exist and belong to this slice. That is a different question from whether
+/// `a` and `b` carry motion: an intra neighbour is a perfectly present
+/// macroblock that simply has no vector, and it yields
+/// [`Neighbour::UNAVAILABLE`] here just as a missing one does. The spec
+/// distinguishes them — only a *missing* neighbour forces the zero vector,
+/// while an intra one falls through to the median — so the caller has to say
+/// which it is.
+pub fn predict_skip_mv(
+    a: Neighbour,
+    b: Neighbour,
+    c: Neighbour,
+    a_present: bool,
+    b_present: bool,
+) -> (i32, i32) {
     // A missing neighbour, or an immediately-adjacent one that is itself
     // stationary against reference 0, forces a zero vector rather than a
     // median. This is what makes static scenes collapse to almost no bits.
-    if a.ref_idx < 0
-        || b.ref_idx < 0
+    if !a_present
+        || !b_present
         || (a.ref_idx == 0 && a.mv == (0, 0))
         || (b.ref_idx == 0 && b.mv == (0, 0))
     {
@@ -669,27 +684,40 @@ mod tests {
 
         // A stationary left neighbour forces zero.
         assert_eq!(
-            predict_skip_mv(n((0, 0), 0), moving, moving),
+            predict_skip_mv(n((0, 0), 0), moving, moving, true, true),
             (0, 0),
             "stationary left neighbour"
         );
         // So does a stationary one above.
         assert_eq!(
-            predict_skip_mv(moving, n((0, 0), 0), moving),
+            predict_skip_mv(moving, n((0, 0), 0), moving, true, true),
             (0, 0),
             "stationary neighbour above"
         );
-        // As does an unavailable neighbour.
+        // As does an absent neighbour.
         assert_eq!(
-            predict_skip_mv(Neighbour::UNAVAILABLE, moving, moving),
+            predict_skip_mv(Neighbour::UNAVAILABLE, moving, moving, false, true),
             (0, 0),
-            "unavailable left neighbour"
+            "absent left neighbour"
+        );
+    }
+
+    /// An intra neighbour is present but carries no vector. The spec forces
+    /// zero only for a *missing* neighbour, so this must fall through to the
+    /// median — where the intra neighbour contributes a zero vector like any
+    /// other unusable one, but does not veto the prediction.
+    #[test]
+    fn an_intra_neighbour_does_not_force_a_zero_skip_vector() {
+        let moving = n((40, 40), 0);
+        assert_eq!(
+            predict_skip_mv(Neighbour::UNAVAILABLE, moving, moving, true, true),
+            (40, 40),
         );
     }
 
     #[test]
     fn skip_uses_the_predictor_when_neighbours_are_moving() {
-        let p = predict_skip_mv(n((8, 4), 0), n((8, 4), 0), n((8, 4), 0));
+        let p = predict_skip_mv(n((8, 4), 0), n((8, 4), 0), n((8, 4), 0), true, true);
         assert_eq!(p, (8, 4));
     }
 }

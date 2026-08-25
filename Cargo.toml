@@ -27,7 +27,7 @@ av1 = ["dep:rav1e"]
 # Off by default and never enabled in a shipping build: it compiles vendored
 # C, which is exactly what the pure-Rust decoder exists to avoid. See
 # `codec::h264::reference`.
-reference-decoder = ["dep:openh264"]
+reference-decoder = ["dep:openh264", "dep:openh264-sys2"]
 
 [dependencies.rav1e]
 version = "0.8"
@@ -49,6 +49,14 @@ required-features = ["av1"]
 # allow dev-dependencies to be optional, and an unconditional one would force
 # the C toolchain on anyone running `cargo test`.
 [dependencies.openh264]
+version = "0.9"
+optional = true
+
+# The raw bindings, for the one encoder parameter the safe wrapper does not
+# expose: `iEntropyCodingModeFlag`. Without it every synthetic fixture is
+# CAVLC, which this decoder does not implement, so the fixtures would exercise
+# nothing. Same feature gate, same test-only status.
+[dependencies.openh264-sys2]
 version = "0.9"
 optional = true
 

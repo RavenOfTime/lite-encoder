@@ -282,11 +282,24 @@ impl PictureState {
     /// `None` for an unavailable neighbour; an intra neighbour yields
     /// [`NO_REF`], which [`super::inter::predict_mv`] treats as a zero vector
     /// against no reference.
-    pub fn motion(&self, block: Option<BlockRef>) -> super::inter::Neighbour {
+    ///
+    /// `curr` and `cur` name the macroblock currently being decoded. A
+    /// partition predicts from the partition to its left, and for the
+    /// right-hand partitions of a macroblock that is one this same macroblock
+    /// decoded moments ago — which is not in `self` yet, because a macroblock
+    /// is only stored once all of it has been decoded. They are parameters
+    /// rather than an optional convenience so that no caller can silently
+    /// predict from the previous picture's macroblock instead.
+    pub fn motion(
+        &self,
+        block: Option<BlockRef>,
+        curr: MbAddr,
+        cur: &MbInfo,
+    ) -> super::inter::Neighbour {
         let Some(block) = block else {
             return super::inter::Neighbour::UNAVAILABLE;
         };
-        let info = self.at(block);
+        let info = if block.mb == curr { cur } else { self.at(block) };
         if info.is_intra() {
             return super::inter::Neighbour::UNAVAILABLE;
         }
@@ -465,20 +478,36 @@ mod tests {
         state.put(0, 0, intra_mb());
         state.put(1, 0, inter);
 
+        // Macroblock 2 stands in for the one being decoded; none of these
+        // neighbours belong to it, so what it holds does not matter.
+        let decoding = MbInfo::skipped();
         let intra_block = BlockRef { mb: 0, blk: 5 };
         assert_eq!(
-            state.motion(Some(intra_block)),
+            state.motion(Some(intra_block), 2, &decoding),
             super::super::inter::Neighbour::UNAVAILABLE
         );
         assert_eq!(
-            state.motion(None),
+            state.motion(None, 2, &decoding),
             super::super::inter::Neighbour::UNAVAILABLE
         );
 
         let inter_block = BlockRef { mb: 1, blk: 5 };
-        let motion = state.motion(Some(inter_block));
+        let motion = state.motion(Some(inter_block), 2, &decoding);
         assert_eq!(motion.mv, (12, -4));
         assert_eq!(motion.ref_idx, 0);
+    }
+
+    /// The partition being predicted from may be one this same macroblock
+    /// decoded a moment ago, which is not in the picture state yet.
+    #[test]
+    fn the_macroblock_being_decoded_is_read_from_its_own_state() {
+        let state = PictureState::new(4, 3);
+        let mut decoding = inter_mb();
+        decoding.fill_motion(0, 0, 8, 16, [-7, 3]);
+
+        let own_block = BlockRef { mb: 1, blk: 1 };
+        let motion = state.motion(Some(own_block), 1, &decoding);
+        assert_eq!(motion.mv, (-7, 3));
     }
 
     /// Under constrained intra prediction an inter neighbour's mode is

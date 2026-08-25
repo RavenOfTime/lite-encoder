@@ -112,17 +112,13 @@ pub fn decode_mb_type(
 /// slices.
 ///
 /// `c` is `Some` only for an I slice, where the first bin takes a
-/// neighbour-derived context; the suffix form uses a single fixed context and
-/// a bank shifted to 17.
+/// neighbour-derived context; the suffix form uses a single fixed context.
 fn decode_intra_mb_type(
     d: &mut ArithDecoder<'_>,
     cx: &mut ContextState,
     c: Option<&MbContext>,
 ) -> u32 {
-    // The two banks are laid out identically apart from where the I_16x16
-    // sub-fields start, which is two contexts later in the I-slice form
-    // because its first bin took three.
-    let (base, shift) = match c {
+    let ctx = match c {
         Some(c) => {
             // condTermFlagN counts neighbours that are *not* I_NxN, since a
             // run of I_NxN macroblocks makes another one likely.
@@ -133,13 +129,13 @@ fn decode_intra_mb_type(
             if d.decode_decision(&mut cx[3 + inc]) == 0 {
                 return 0;
             }
-            (5, 1)
+            IntraMbTypeCtx::I_SLICE
         }
         None => {
             if d.decode_decision(&mut cx[17]) == 0 {
                 return 0;
             }
-            (17, 0)
+            IntraMbTypeCtx::P_SUFFIX
         }
     };
 
@@ -149,14 +145,55 @@ fn decode_intra_mb_type(
         return 25;
     }
 
-    let mut value = 1;
-    value += 12 * d.decode_decision(&mut cx[base + 1]) as u32;
-    if d.decode_decision(&mut cx[base + 2]) == 1 {
-        value += 4 + 4 * d.decode_decision(&mut cx[base + 2 + shift]) as u32;
+    let mut value = 1 + 12 * d.decode_decision(&mut cx[ctx.luma]) as u32;
+    if d.decode_decision(&mut cx[ctx.chroma_first]) == 1 {
+        value += 4;
+        if d.decode_decision(&mut cx[ctx.chroma_second]) == 1 {
+            value += 4;
+        }
     }
-    value += 2 * d.decode_decision(&mut cx[base + 3 + shift]) as u32;
-    value += d.decode_decision(&mut cx[base + 3 + 2 * shift]) as u32;
+    value += 2 * d.decode_decision(&mut cx[ctx.mode_first]) as u32;
+    value += d.decode_decision(&mut cx[ctx.mode_second]) as u32;
     value
+}
+
+/// Context indices for the `I_16x16` part of the intra `mb_type` tree.
+///
+/// Spec table 9-39 assigns these per `ctxIdxOffset`, and the two banks are not
+/// the same shape: the I-slice bank gives the two chroma bins separate
+/// contexts, while the P suffix codes both from one. Writing the indices out
+/// rather than deriving them from a base is deliberate — the arithmetic that
+/// works for one bank silently reads the wrong context in the other, and a
+/// wrong context does not fail, it just decodes a different macroblock type
+/// and desynchronises a few macroblocks later.
+struct IntraMbTypeCtx {
+    /// `CodedBlockPatternLuma != 0`.
+    luma: usize,
+    /// `CodedBlockPatternChroma != 0`.
+    chroma_first: usize,
+    /// `CodedBlockPatternChroma == 2`.
+    chroma_second: usize,
+    mode_first: usize,
+    mode_second: usize,
+}
+
+impl IntraMbTypeCtx {
+    /// `ctxIdxOffset` 3, with increments 3, 4, 5, 6 and 7.
+    const I_SLICE: Self = Self {
+        luma: 6,
+        chroma_first: 7,
+        chroma_second: 8,
+        mode_first: 9,
+        mode_second: 10,
+    };
+    /// `ctxIdxOffset` 17, with increments 1, 2, 2, 3 and 3.
+    const P_SUFFIX: Self = Self {
+        luma: 18,
+        chroma_first: 19,
+        chroma_second: 19,
+        mode_first: 20,
+        mode_second: 20,
+    };
 }
 
 /// `sub_mb_type` for a P slice, spec table 9-38. Contexts 21..23.
@@ -225,7 +262,9 @@ pub fn decode_intra_pred_mode(
     if d.decode_decision(&mut cx[68]) == 1 {
         return predicted;
     }
-    // Three fixed-length bins, all sharing one context, LSB first.
+    // Three fixed-length bins share context 69. The CABAC binarisation emits
+    // the least-significant bit first (table 9-34), unlike the usual
+    // most-significant-bit-first fixed-length syntax.
     let mut mode = 0;
     for bit in 0..3 {
         mode |= d.decode_decision(&mut cx[69]) << bit;

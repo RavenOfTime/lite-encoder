@@ -199,6 +199,7 @@ fn diff_frame(reference: &Frame, subject: &Frame, index: usize) -> Option<Diverg
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::h264::decoder::Frontend;
     use crate::codec::h264::reference::synthesize;
     use crate::media::Packet;
 
@@ -213,6 +214,30 @@ mod tests {
         let report = compare(&stream.annexb, &mut subject).expect("compare");
         assert!(report.matches(), "{report}");
         assert_eq!(report.reference_frames, 6);
+    }
+
+    /// The decoder under test, against the oracle, on an all-intra stream.
+    ///
+    /// This is the test the whole harness exists for. All-intra first: an
+    /// I picture depends on nothing outside itself, so a failure here is a
+    /// bug in entropy decode, prediction, or reconstruction, with no chance
+    /// that it is inherited from a wrong reference picture.
+    #[test]
+    fn our_decoder_matches_the_reference_on_an_intra_stream() {
+        let stream = synthesize(64, 48, 3, 1).expect("encode");
+        let mut subject = Frontend::new();
+        let report = compare(&stream.annexb, &mut subject).expect("compare");
+        assert!(report.matches(), "{report}");
+    }
+
+    /// And on a stream with P pictures, which adds motion compensation and
+    /// the reference picture list to the surface under test.
+    #[test]
+    fn our_decoder_matches_the_reference_with_inter_prediction() {
+        let stream = synthesize(64, 48, 6, 6).expect("encode");
+        let mut subject = Frontend::new();
+        let report = compare(&stream.annexb, &mut subject).expect("compare");
+        assert!(report.matches(), "{report}");
     }
 
     /// And it must find something when there is. A decoder that flips the low

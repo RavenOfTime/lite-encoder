@@ -1,0 +1,354 @@
+//! Decoded pictures and the reference picture buffer.
+//!
+//! # Why this is small
+//!
+//! The decoded picture buffer is one of the more intricate parts of H.264 in
+//! general, and almost none of that intricacy is reachable here. Without B
+//! frames there is no reordering, so output order is decode order and picture
+//! order counts never have to be computed. Without long-term references there
+//! is no adaptive marking to track. What remains is a short queue of recent
+//! pictures, ordered so that reference index 0 means "the most recent one",
+//! and a rule for dropping the oldest when it fills.
+//!
+//! Refusing the rest is deliberate. A decoder that half-implements reference
+//! reordering does not fail on the stream that uses it; it silently predicts
+//! from the wrong picture, which looks like a motion compensation bug and is
+//! among the most expensive things to chase. See [`super`] for the scope.
+
+use std::time::Duration;
+
+use super::inter::Plane;
+use crate::media::Frame;
+
+/// A decoded picture, in 4:2:0 planar 8-bit.
+///
+/// Dimensions are the *coded* ones, a whole number of macroblocks. The
+/// display rectangle is usually smaller: 1080 is not a multiple of 16, so
+/// every 1080p stream codes 1088 lines and crops eight of them away. Cropping
+/// happens on the way out, in [`Self::to_frame`], because prediction and
+/// deblocking work on coded samples throughout.
+#[derive(Debug, Clone)]
+pub struct Picture {
+    pub width: usize,
+    pub height: usize,
+    pub planes: [Vec<u8>; 3],
+    pub strides: [usize; 3],
+    /// `frame_num` from the slice header, which is what reference lists are
+    /// ordered by.
+    pub frame_num: u16,
+}
+
+impl Picture {
+    /// An all-grey picture of `width_mbs` by `height_mbs` macroblocks.
+    ///
+    /// Mid-grey rather than black: a picture that is somehow displayed before
+    /// being fully decoded is then visibly wrong rather than plausibly dark.
+    pub fn new(width_mbs: usize, height_mbs: usize) -> Self {
+        let (width, height) = (width_mbs * 16, height_mbs * 16);
+        let (cw, ch) = (width / 2, height / 2);
+        Self {
+            width,
+            height,
+            planes: [
+                vec![128; width * height],
+                vec![128; cw * ch],
+                vec![128; cw * ch],
+            ],
+            strides: [width, cw, cw],
+            frame_num: 0,
+        }
+    }
+
+    /// The luma plane, as inter prediction wants it.
+    pub fn luma(&self) -> Plane<'_> {
+        Plane {
+            data: &self.planes[0],
+            width: self.width,
+            height: self.height,
+            stride: self.strides[0],
+        }
+    }
+
+    /// One chroma plane, `comp` being 0 for U and 1 for V.
+    pub fn chroma(&self, comp: usize) -> Plane<'_> {
+        Plane {
+            data: &self.planes[comp + 1],
+            width: self.width / 2,
+            height: self.height / 2,
+            stride: self.strides[comp + 1],
+        }
+    }
+
+    /// Copies out the display rectangle as a [`Frame`].
+    pub fn to_frame(&self, crop: Cropping, pts: Duration) -> Frame {
+        let (width, height) = crop.display_size(self.width, self.height);
+        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+        Frame {
+            pts,
+            width: width as u32,
+            height: height as u32,
+            planes: [
+                self.crop_plane(0, crop.left, crop.top, width, height),
+                self.crop_plane(1, crop.left / 2, crop.top / 2, cw, ch),
+                self.crop_plane(2, crop.left / 2, crop.top / 2, cw, ch),
+            ],
+            strides: [width, cw, cw],
+        }
+    }
+
+    fn crop_plane(&self, plane: usize, x: usize, y: usize, width: usize, height: usize) -> Vec<u8> {
+        let stride = self.strides[plane];
+        (0..height)
+            .flat_map(|row| {
+                let start = (y + row) * stride + x;
+                &self.planes[plane][start..start + width]
+            })
+            .copied()
+            .collect()
+    }
+}
+
+/// The display rectangle, as an inset from the coded picture in luma samples.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Cropping {
+    pub left: usize,
+    pub right: usize,
+    pub top: usize,
+    pub bottom: usize,
+}
+
+impl Cropping {
+    /// Builds a crop from the sequence parameter set's offsets.
+    ///
+    /// The offsets are in chroma samples for 4:2:0, so each is worth two luma
+    /// samples. That factor is why a stream can only crop an even number of
+    /// columns, and why 1088-to-1080 works but an odd inset could not be
+    /// expressed at all.
+    pub fn from_sps_offsets(left: u32, right: u32, top: u32, bottom: u32) -> Self {
+        Self {
+            left: left as usize * 2,
+            right: right as usize * 2,
+            top: top as usize * 2,
+            bottom: bottom as usize * 2,
+        }
+    }
+
+    /// The visible size of a coded picture of the given dimensions.
+    pub fn display_size(&self, width: usize, height: usize) -> (usize, usize) {
+        (
+            width.saturating_sub(self.left + self.right).max(1),
+            height.saturating_sub(self.top + self.bottom).max(1),
+        )
+    }
+}
+
+/// The short-term reference pictures available for prediction.
+///
+/// Ordered most-recent-first, which for a P slice with no reference list
+/// modification is exactly the list the spec derives: descending `PicNum`.
+/// Reference index 0 is therefore the previous picture, which in surveillance
+/// footage is what essentially every macroblock uses.
+#[derive(Debug, Clone)]
+pub struct Dpb {
+    refs: Vec<Picture>,
+    capacity: usize,
+    max_frame_num: u32,
+}
+
+impl Dpb {
+    /// `capacity` is the sequence parameter set's `max_num_ref_frames`, and
+    /// `max_frame_num` its `MaxFrameNum`.
+    pub fn new(capacity: usize, max_frame_num: u32) -> Self {
+        Self {
+            // At least one, or a stream declaring zero reference frames would
+            // leave P slices with nothing to predict from.
+            refs: Vec::new(),
+            capacity: capacity.max(1),
+            max_frame_num,
+        }
+    }
+
+    /// Empties the buffer, as an IDR picture requires.
+    ///
+    /// An IDR is a hard boundary: nothing before it may be referenced, which
+    /// is the property that makes it a seek point and a recovery point after
+    /// packet loss.
+    pub fn clear(&mut self) {
+        self.refs.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.refs.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.refs.len()
+    }
+
+    /// The reference picture at index `idx` of list 0.
+    pub fn get(&self, idx: usize) -> Option<&Picture> {
+        self.refs.get(idx)
+    }
+
+    /// Adds a picture as the most recent reference, dropping the oldest if
+    /// the buffer is full.
+    ///
+    /// This is the sliding window of spec 8.2.5.3. "Oldest" is by
+    /// `FrameNumWrap`, not by arrival, which matters because `frame_num`
+    /// wraps: without accounting for the wrap, the picture immediately after
+    /// one would look like the oldest in the buffer and be evicted first.
+    pub fn push(&mut self, picture: Picture) {
+        let current = picture.frame_num;
+        self.refs.insert(0, picture);
+        if self.refs.len() > self.capacity {
+            let max = self.max_frame_num;
+            let oldest = self
+                .refs
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, p)| frame_num_wrap(p.frame_num, current, max))
+                .map(|(i, _)| i);
+            if let Some(oldest) = oldest {
+                self.refs.remove(oldest);
+            }
+        }
+    }
+}
+
+/// Spec `FrameNumWrap`: a picture's `frame_num` expressed relative to the
+/// current one, so that ordering survives the counter wrapping.
+fn frame_num_wrap(frame_num: u16, current: u16, max_frame_num: u32) -> i64 {
+    let (frame_num, current) = (i64::from(frame_num), i64::from(current));
+    if frame_num > current {
+        frame_num - i64::from(max_frame_num)
+    } else {
+        frame_num
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn picture_numbered(frame_num: u16) -> Picture {
+        let mut p = Picture::new(2, 2);
+        p.frame_num = frame_num;
+        p
+    }
+
+    #[test]
+    fn a_new_picture_is_sized_in_whole_macroblocks_and_is_grey() {
+        let p = Picture::new(4, 3);
+        assert_eq!((p.width, p.height), (64, 48));
+        assert_eq!(p.planes[0].len(), 64 * 48);
+        assert_eq!(p.planes[1].len(), 32 * 24);
+        assert_eq!(p.strides, [64, 32, 32]);
+        assert!(p.planes.iter().all(|plane| plane.iter().all(|&s| s == 128)));
+    }
+
+    #[test]
+    fn the_planes_report_their_own_dimensions_for_edge_clamping() {
+        let p = Picture::new(4, 3);
+        let luma = p.luma();
+        assert_eq!((luma.width, luma.height, luma.stride), (64, 48, 64));
+        let chroma = p.chroma(1);
+        assert_eq!((chroma.width, chroma.height, chroma.stride), (32, 24, 32));
+    }
+
+    /// The case every 1080p stream hits: 1080 is not a multiple of 16, so the
+    /// picture is coded as 1088 lines and eight are cropped away.
+    #[test]
+    fn cropping_removes_the_padding_rows_of_a_1080_picture() {
+        let crop = Cropping::from_sps_offsets(0, 0, 0, 4);
+        assert_eq!(crop.bottom, 8);
+        assert_eq!(crop.display_size(1920, 1088), (1920, 1080));
+    }
+
+    #[test]
+    fn cropping_copies_the_right_rectangle() {
+        let mut p = Picture::new(2, 2);
+        // Mark the sample at (4, 6) so the crop offset can be checked rather
+        // than just the resulting size.
+        p.planes[0][6 * 32 + 4] = 200;
+        let crop = Cropping::from_sps_offsets(2, 0, 3, 0);
+        let frame = p.to_frame(crop, Duration::ZERO);
+
+        assert_eq!((frame.width, frame.height), (28, 26));
+        assert_eq!(frame.planes[0].len(), 28 * 26);
+        // The marked sample moved left by 4 and up by 6.
+        assert_eq!(frame.planes[0][0], 200);
+        assert_eq!(frame.planes[1].len(), 14 * 13);
+    }
+
+    #[test]
+    fn an_uncropped_picture_comes_out_whole() {
+        let p = Picture::new(2, 2);
+        let frame = p.to_frame(Cropping::default(), Duration::from_millis(40));
+        assert_eq!((frame.width, frame.height), (32, 32));
+        assert_eq!(frame.planes[0].len(), 32 * 32);
+        assert_eq!(frame.pts, Duration::from_millis(40));
+    }
+
+    #[test]
+    fn the_most_recently_pushed_picture_is_reference_zero() {
+        let mut dpb = Dpb::new(4, 16);
+        dpb.push(picture_numbered(1));
+        dpb.push(picture_numbered(2));
+        assert_eq!(dpb.get(0).unwrap().frame_num, 2);
+        assert_eq!(dpb.get(1).unwrap().frame_num, 1);
+        assert_eq!(dpb.len(), 2);
+    }
+
+    #[test]
+    fn the_buffer_never_grows_past_its_capacity() {
+        let mut dpb = Dpb::new(2, 16);
+        for frame_num in 0..6 {
+            dpb.push(picture_numbered(frame_num));
+        }
+        assert_eq!(dpb.len(), 2);
+        assert_eq!(dpb.get(0).unwrap().frame_num, 5);
+        assert_eq!(dpb.get(1).unwrap().frame_num, 4);
+    }
+
+    /// The wrap is the reason eviction is by `FrameNumWrap` and not by
+    /// arrival order: after the counter wraps, picture 0 is the *newest*, and
+    /// evicting the numerically smallest would throw it away immediately.
+    #[test]
+    fn eviction_survives_the_frame_number_wrapping() {
+        let mut dpb = Dpb::new(2, 16);
+        dpb.push(picture_numbered(14));
+        dpb.push(picture_numbered(15));
+        // The counter wraps back to zero, which is newer than both.
+        dpb.push(picture_numbered(0));
+
+        assert_eq!(dpb.len(), 2);
+        assert_eq!(dpb.get(0).unwrap().frame_num, 0);
+        // 14 was the oldest and is gone; 15 remains.
+        assert_eq!(dpb.get(1).unwrap().frame_num, 15);
+    }
+
+    #[test]
+    fn an_idr_empties_the_buffer() {
+        let mut dpb = Dpb::new(4, 16);
+        dpb.push(picture_numbered(1));
+        dpb.clear();
+        assert!(dpb.is_empty());
+        assert!(dpb.get(0).is_none());
+    }
+
+    /// A stream declaring no reference frames still has to hold one, or its
+    /// P slices would have nothing to predict from.
+    #[test]
+    fn a_zero_capacity_buffer_still_holds_one_reference() {
+        let mut dpb = Dpb::new(0, 16);
+        dpb.push(picture_numbered(1));
+        assert_eq!(dpb.len(), 1);
+    }
+
+    #[test]
+    fn frame_numbers_order_correctly_across_the_wrap() {
+        // Relative to picture 1, picture 15 is in the past, not the future.
+        assert!(frame_num_wrap(15, 1, 16) < frame_num_wrap(0, 1, 16));
+        assert!(frame_num_wrap(1, 1, 16) > frame_num_wrap(0, 1, 16));
+    }
+}

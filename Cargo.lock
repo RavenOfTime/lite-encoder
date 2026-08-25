@@ -791,6 +791,7 @@ dependencies = [
  "futures",
  "h264-reader",
  "openh264",
+ "openh264-sys2",
  "rav1e",
  "retina",
  "serde",

@@ -148,12 +148,19 @@ impl<'a> ArithDecoder<'a> {
     /// Returns `None` if there are not the nine bits the spec requires to
     /// prime `codIOffset`.
     pub fn new(data: &'a [u8]) -> Option<Self> {
-        if data.len() * 8 < 9 {
+        Self::new_at_bit(data, 0)
+    }
+
+    /// Starts at an arbitrary RBSP bit. Parsed H.264 CABAC slices are
+    /// byte-aligned after their `cabac_alignment_one_bit` padding, but this
+    /// entry point keeps the arithmetic reader usable for bit-level tests.
+    pub fn new_at_bit(data: &'a [u8], bit_pos: usize) -> Option<Self> {
+        if data.len() * 8 < bit_pos + 9 {
             return None;
         }
         let mut d = ArithDecoder {
             data,
-            bit_pos: 0,
+            bit_pos,
             range: 510,
             offset: 0,
         };
