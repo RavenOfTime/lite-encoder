@@ -56,6 +56,11 @@ pub fn from_webm_ticks(ticks: u64) -> Duration {
     Duration::from_nanos(ticks * WEBM_TIMESTAMP_SCALE_NS)
 }
 
+/// Convert an MPEG-TS/PES 33-bit PTS (90 kHz clock) to a job-timeline PTS.
+pub fn mpegts_pts_to_duration(ticks: u64) -> Duration {
+    Duration::from_nanos((u128::from(ticks) * 100_000 / 9) as u64)
+}
+
 /// Signed tick offset from `cluster_base` to `pts` for a SimpleBlock.
 pub fn webm_block_offset(pts: Duration, cluster_base: Duration) -> Result<i16, Error> {
     let rel = webm_ticks(pts) as i128 - webm_ticks(cluster_base) as i128;
@@ -91,6 +96,13 @@ mod tests {
         let base = Duration::from_secs(10);
         let last = base + MAX_CLUSTER_SPAN - Duration::from_millis(1);
         assert!(webm_block_offset(last, base).is_ok());
+    }
+
+    #[test]
+    fn mpegts_pts_converts_90khz_ticks_to_nanoseconds() {
+        assert_eq!(mpegts_pts_to_duration(0), Duration::ZERO);
+        assert_eq!(mpegts_pts_to_duration(90_000), Duration::from_secs(1));
+        assert_eq!(mpegts_pts_to_duration(45_000), Duration::from_millis(500));
     }
 
     #[test]

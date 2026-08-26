@@ -11,6 +11,8 @@
 //! coded frame, no interlacing and no redundant slices, which reduces spec
 //! 7.4.1.2.4 to the two rules in [`starts_access_unit`].
 
+use h264_reader::nal::Nal;
+
 /// Every NAL unit payload in an Annex B stream.
 ///
 /// Yields the bytes *between* start codes, so each slice begins with the NAL
@@ -62,6 +64,49 @@ impl<'a> Iterator for NalUnits<'a> {
 /// Index of the next `00 00 01` at or after `from`.
 fn find_start_code(stream: &[u8], from: usize) -> Option<usize> {
     (from..stream.len().saturating_sub(2)).find(|&i| stream[i..i + 3] == [0, 0, 1])
+}
+
+/// Pixel dimensions from the stream's first SPS.
+///
+/// Shared by every demuxer that reads Annex B directly (elementary streams
+/// and MPEG-TS's video PES payload): both need a track's width/height before
+/// a single packet is handed out, and both get there the same way.
+pub fn sps_dimensions(stream: &[u8]) -> Option<(u32, u32)> {
+    nal_units(stream).find_map(|nal| {
+        if nal.first()? & 0x1f != 7 {
+            return None;
+        }
+        let rn = h264_reader::nal::RefNal::new(nal, &[], true);
+        h264_reader::nal::sps::SeqParameterSet::from_bits(rn.rbsp_bits())
+            .ok()?
+            .pixel_dimensions()
+            .ok()
+    })
+}
+
+/// The stream's first SPS and PPS, start codes included, as `extra_data`.
+pub fn parameter_sets(stream: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut have_sps = false;
+    let mut have_pps = false;
+    for nal in nal_units(stream) {
+        let kind = match nal.first() {
+            Some(b) => b & 0x1f,
+            None => continue,
+        };
+        let take = (kind == 7 && !have_sps) || (kind == 8 && !have_pps);
+        if !take {
+            if have_sps && have_pps {
+                break;
+            }
+            continue;
+        }
+        have_sps |= kind == 7;
+        have_pps |= kind == 8;
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(nal);
+    }
+    out
 }
 
 /// Access units, as slices of the original stream including their start codes.

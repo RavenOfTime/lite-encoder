@@ -1,16 +1,18 @@
 //! Demux: read compressed [`Packet`]s and their [`Track`] layout from an input.
 //!
-//! One concrete implementation exists today, [`annexb::AnnexBDemuxer`], for
-//! elementary H.264. Container demuxers (MKV, MP4, TS) are P2 work; this
-//! trait is the seam they will land behind.
+//! Implementations: [`annexb::AnnexBDemuxer`] for elementary H.264,
+//! [`mkv::MkvDemuxer`] and [`mp4::Mp4Demuxer`] for their containers, and
+//! [`ts::TsDemuxer`] for single-program H.264-over-MPEG-TS.
 
 pub mod annexb;
 pub mod mkv;
 pub mod mp4;
+pub mod ts;
 
 pub use annexb::AnnexBDemuxer;
 pub use mkv::MkvDemuxer;
 pub use mp4::Mp4Demuxer;
+pub use ts::TsDemuxer;
 
 use crate::media::{Packet, Track};
 use crate::Error;

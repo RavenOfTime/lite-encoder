@@ -47,10 +47,12 @@ cargo build --release
 | **WebM mux** | EBML/Matroska subset, structurally validated (`tools/ebml_check.py`) |
 | **Annex B read** | `demux::AnnexBDemuxer` — elementary H.264, one video track |
 | **MKV mux/demux** | `mux::MkvMuxer` + `demux::MkvDemuxer` — full Matroska codec list (H.264 included); SimpleBlock only, 1 ms `TimestampScale` only |
-| **`Demuxer` / `Muxer` traits** | `demux`, `mux`; impls: `AnnexBDemuxer`, `MkvDemuxer`, `WebmMuxer`, `MkvMuxer` |
+| **MP4 mux/demux** | `mux::Mp4Muxer` + `demux::Mp4Demuxer` — H.264 only, flat (non-fragmented); structurally validated (`tools/mp4_check.py`) |
+| **Annex B ⇄ AVCC reframe** | `codec::h264::avcc` — the bitstream filter MKV/MP4 remux needs (start codes ⇄ length-prefixed NALs + `avcC`) |
+| **MPEG-TS demux** | `demux::TsDemuxer` — single-program H.264 (`stream_type 0x1B`) only; PAT/PMT sections must fit in one 188-byte packet |
+| **`Demuxer` / `Muxer` traits** | `demux`, `mux`; impls: `AnnexBDemuxer`, `MkvDemuxer`, `Mp4Demuxer`, `TsDemuxer`, `WebmMuxer`, `MkvMuxer`, `Mp4Muxer` |
 | **`-c copy` remux** | `remux::copy_remux` — no decode, packets straight to muxer |
 | **`Probe`** | `probe::probe()` — magic bytes + extension, container only (no track parse yet) |
-| **Demux/mux (MP4/fMP4, TS)** | Not started |
 | **CLI** | **`liteenc`** stub only — `./target/release/liteenc --help` |
 
 ### Out of scope (removed from product)
@@ -68,12 +70,12 @@ Legend: **Y** supported, **P** planned, **—** later / evaluate.
 | Annex B (`.h264`) | **Y** | P | Elementary; today’s bench path |
 | WebM | — | **Y** | AV1/VP8/VP9 + Vorbis/Opus only |
 | Matroska (`.mkv`) | **Y** | **Y** | Full codec list; SimpleBlock only, no lacing |
-| MP4 / fMP4 | P | P | Remux + browser MSE path |
-| MPEG-TS | P | — | Common broadcast/capture |
+| MP4 (flat) | **Y** | **Y** | H.264 only; fMP4/fragmented not attempted |
+| MPEG-TS | **Y** | — | Single-program H.264 only; no audio yet |
 
 | Codec | Decode | Encode | Notes |
 |---|---|---|---|
-| H.264 | **Y** (Rust) | P | 8-bit 4:2:0 CABAC I/P subset |
+| H.264 | **Y** (Rust) | P | 8-bit 4:2:0 CABAC I/P subset; muxes into MKV/MP4, not WebM |
 | H.265 | P | P | Next decoder |
 | AV1 | P | **Y** (rav1e) | Feature-gated |
 | VP9 / VP8 | P | P | WebM targets |
@@ -87,7 +89,10 @@ release. See [`todo.md`](todo.md) for the ordered checklist.
 - **Decoders we ship in Rust** are validated bit-exact against a reference
   oracle (OpenH264 for H.264 in CI only — never linked in default builds).
 - **Mux output** is checked with tooling that shares no code with the muxer
-  (`tools/ebml_check.py`).
+  (`tools/ebml_check.py` for WebM/MKV, `tools/mp4_check.py` for MP4).
+- **MPEG-TS read** has no independent validator (there is no `TsMuxer` to
+  check against); `tests/ts_remux.rs` packetizes the camera fixture into TS
+  bytes itself and checks `TsDemuxer` recovers every access unit byte-exact.
 - Wrong pixels fail on the **first differing coordinate**, not an average score.
 
 ## Layout
@@ -95,8 +100,8 @@ release. See [`todo.md`](todo.md) for the ordered checklist.
 ```text
 src/codec/     decoders and encoders (H.264, AV1, …)
 src/media/     Codec, Frame, Packet, Decoder/Encoder traits, time base
-src/demux/     Demuxer trait; AnnexBDemuxer, MkvDemuxer
-src/mux/       Muxer trait; EBML + shared Matroska core; WebmMuxer, MkvMuxer
+src/demux/     Demuxer trait; AnnexBDemuxer, MkvDemuxer, Mp4Demuxer, TsDemuxer
+src/mux/       Muxer trait; EBML + shared Matroska core; WebmMuxer, MkvMuxer, Mp4Muxer
 src/probe.rs   container sniff (magic bytes + extension)
 src/registry.rs  (container, codec) → read/write support table
 src/remux.rs   `-c copy`: demuxer packets straight to a muxer, no decode
@@ -134,6 +139,13 @@ Synthetic WebM + structural check:
 ```text
 cargo run --example write_webm -- out.webm
 python tools/ebml_check.py out.webm
+```
+
+Camera fixture → MP4 (Annex B → AVCC reframe) + structural check:
+
+```text
+cargo run --example write_mp4 -- out.mp4
+python tools/mp4_check.py out.mp4
 ```
 
 Transcode experiment (Annex B → AV1 WebM, `--features av1`):

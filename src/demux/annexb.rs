@@ -6,11 +6,8 @@
 
 use std::time::Duration;
 
-use h264_reader::nal::sps::SeqParameterSet;
-use h264_reader::nal::Nal;
-
 use super::Demuxer;
-use crate::codec::h264::annexb::{access_units, nal_units};
+use crate::codec::h264::annexb::{access_units, nal_units, parameter_sets, sps_dimensions};
 use crate::media::{Codec, Packet, Track, TrackId, TrackKind};
 use crate::Error;
 
@@ -70,45 +67,6 @@ impl Demuxer for AnnexBDemuxer {
             data: bytes::Bytes::from(data),
         }))
     }
-}
-
-/// Pixel dimensions from the stream's first SPS.
-fn sps_dimensions(data: &[u8]) -> Option<(u32, u32)> {
-    nal_units(data).find_map(|nal| {
-        if nal.first()? & 0x1f != 7 {
-            return None;
-        }
-        let rn = h264_reader::nal::RefNal::new(nal, &[], true);
-        SeqParameterSet::from_bits(rn.rbsp_bits())
-            .ok()?
-            .pixel_dimensions()
-            .ok()
-    })
-}
-
-/// The stream's first SPS and PPS, start codes included, as `extra_data`.
-fn parameter_sets(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut have_sps = false;
-    let mut have_pps = false;
-    for nal in nal_units(data) {
-        let kind = match nal.first() {
-            Some(b) => b & 0x1f,
-            None => continue,
-        };
-        let take = (kind == 7 && !have_sps) || (kind == 8 && !have_pps);
-        if !take {
-            if have_sps && have_pps {
-                break;
-            }
-            continue;
-        }
-        have_sps |= kind == 7;
-        have_pps |= kind == 8;
-        out.extend_from_slice(&[0, 0, 0, 1]);
-        out.extend_from_slice(nal);
-    }
-    out
 }
 
 #[cfg(test)]

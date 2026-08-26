@@ -32,8 +32,16 @@ pub fn support(container: Container, codec: Codec) -> Support {
             read: codec.matroska_id().is_some(),
             write: codec.matroska_id().is_some(),
         },
-        // MP4/TS demux and mux are still P2 work; no cell is lit yet.
-        Container::Mp4 | Container::MpegTs => Support::default(),
+        // H.264 video only, both directions; see `mux::Mp4Muxer` / `demux::Mp4Demuxer`.
+        Container::Mp4 => Support {
+            read: codec == Codec::H264,
+            write: codec == Codec::H264,
+        },
+        // H.264 read only; see `demux::TsDemuxer`. TS write is not planned.
+        Container::MpegTs => Support {
+            read: codec == Codec::H264,
+            write: false,
+        },
     }
 }
 
@@ -75,11 +83,17 @@ mod tests {
     }
 
     #[test]
-    fn unstarted_containers_support_nothing_yet() {
-        for container in [Container::Mp4, Container::MpegTs] {
-            for codec in [Codec::H264, Codec::Av1, Codec::Opus] {
-                assert_eq!(support(container, codec), Support::default());
-            }
-        }
+    fn mp4_reads_and_writes_h264_only() {
+        assert!(can_read(Container::Mp4, Codec::H264));
+        assert!(can_write(Container::Mp4, Codec::H264));
+        assert!(!can_read(Container::Mp4, Codec::Av1));
+        assert!(!can_write(Container::Mp4, Codec::Aac));
+    }
+
+    #[test]
+    fn mpeg_ts_reads_h264_only() {
+        assert!(can_read(Container::MpegTs, Codec::H264));
+        assert!(!can_read(Container::MpegTs, Codec::Av1));
+        assert!(!can_write(Container::MpegTs, Codec::H264));
     }
 }
