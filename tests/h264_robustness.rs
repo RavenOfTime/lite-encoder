@@ -184,6 +184,48 @@ fn known_invalid_cabac_bit_flips_fail_without_panicking_or_emitting_a_frame() {
     }
 }
 
+/// Spec 7.4.3.1 bounds `ref_pic_list_modification` command counts by
+/// `num_ref_idx_l0_active_minus1 + 1`, but that is only a conformance
+/// requirement: a corrupt or hostile stream can carry more. Reordering placed
+/// command i at index i of a list only `num_ref_idx_l0` long, so an overlong
+/// command list indexed past its end.
+#[test]
+fn overlong_ref_pic_list_modification_is_rejected_without_panicking() {
+    let access_unit = annexb::access_units(CAMERA_FIXTURE)[1];
+    let header = first_slice_header_offset(access_unit);
+    // NAL header plus a five-byte slice header: frame_num 1, POC lsb 1,
+    // num_ref_idx_l0_active_minus1 = 0, one Subtract(0) reordering command,
+    // adaptive MMCO, slice_qp_delta = +6, no deblocking offsets.
+    assert_eq!(
+        &access_unit[header..header + 6],
+        &[0x41, 0xe2, 0x1f, 0x92, 0xb8, 0xcf],
+        "fixture P slice header changed"
+    );
+    // The same header up to num_ref_idx_l0_active_minus1, then three L0
+    // reordering commands for that single active index: Subtract(0) followed by
+    // two Subtract(15). MaxPicNum is 16, so each of the latter wraps back onto
+    // the picture the first one selected. Every command therefore resolves to a
+    // real reference and the missing-PicNum path cannot catch the overrun.
+    // Sliding-window marking, cabac_init_idc 0, slice_qp_delta 0 and default
+    // deblocking round the header off to exactly six bytes, so the CABAC
+    // payload that follows stays byte-aligned.
+    let mut corrupted = access_unit[..header].to_vec();
+    corrupted.extend_from_slice(&[0x41, 0xe2, 0x1f, 0xc2, 0x10, 0x81, 0x1f]);
+    corrupted.extend_from_slice(&access_unit[header + 6..]);
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        initialized_decoder().decode_access_unit(&corrupted, Duration::from_millis(40))
+    }));
+    let decoded = outcome.expect("overlong ref_pic_list_modification caused a panic");
+    let error = decoded.expect_err("overlong ref_pic_list_modification emitted a frame");
+    assert!(
+        error
+            .to_string()
+            .contains("ref_pic_list_modification carries 3 commands"),
+        "{error}"
+    );
+}
+
 #[test]
 fn p_slice_with_an_empty_dpb_is_rejected_without_panicking() {
     let access_units = annexb::access_units(CAMERA_FIXTURE);

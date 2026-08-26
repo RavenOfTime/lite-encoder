@@ -153,15 +153,6 @@ pub fn parse_cabac(ctx: &Context, nal: &[u8]) -> Result<CabacSlice, Error> {
     if header_data.redundant_pic_cnt.is_some_and(|count| count > 0) {
         return Err(decode("redundant coded pictures are unsupported"));
     }
-    let list_mods = short_term_list_mods(&header_data.ref_pic_list_modification)?;
-    let marking = ref_marking(&header_data.dec_ref_pic_marking)?;
-    let slice_qp = (26 + pps.pic_init_qp_minus26 + header_data.slice_qp_delta)
-        .try_into()
-        .map_err(|_| decode("slice quantiser outside 0..=51"))?;
-    let cabac_init_idc = header_data.cabac_init_idc.unwrap_or(0);
-    if cabac_init_idc > 2 {
-        return Err(decode("cabac_init_idc outside 0..=2"));
-    }
     // The slice header may override the PPS default; when it does not, the
     // PPS value stands.
     let num_ref_idx_l0 = match header_data.num_ref_idx_active {
@@ -175,6 +166,15 @@ pub fn parse_cabac(ctx: &Context, nal: &[u8]) -> Result<CabacSlice, Error> {
         None => pps.num_ref_idx_l0_default_active_minus1,
     } as usize
         + 1;
+    let list_mods = short_term_list_mods(&header_data.ref_pic_list_modification, num_ref_idx_l0)?;
+    let marking = ref_marking(&header_data.dec_ref_pic_marking)?;
+    let slice_qp = (26 + pps.pic_init_qp_minus26 + header_data.slice_qp_delta)
+        .try_into()
+        .map_err(|_| decode("slice quantiser outside 0..=51"))?;
+    let cabac_init_idc = header_data.cabac_init_idc.unwrap_or(0);
+    if cabac_init_idc > 2 {
+        return Err(decode("cabac_init_idc outside 0..=2"));
+    }
     let deblocking = Deblocking {
         disable_idc: header_data.disable_deblocking_filter_idc,
         alpha_offset: bits.alpha_offset_div2 * 2,
@@ -326,8 +326,12 @@ fn skip_cabac_alignment(rbsp: &[u8], header_end: usize) -> Result<usize, Error> 
     Ok(header_end + padding)
 }
 
-/// Collects short-term L0 modifications; rejects long-term reordering.
-fn short_term_list_mods(mods: &Option<RefPicListModifications>) -> Result<Vec<RefListMod>, Error> {
+/// Collects short-term L0 modifications; rejects long-term reordering and
+/// command counts that overrun list 0.
+fn short_term_list_mods(
+    mods: &Option<RefPicListModifications>,
+    num_ref_idx_l0: usize,
+) -> Result<Vec<RefListMod>, Error> {
     let commands = match mods {
         Some(RefPicListModifications::P {
             ref_pic_list_modification_l0,
@@ -339,6 +343,17 @@ fn short_term_list_mods(mods: &Option<RefPicListModifications>) -> Result<Vec<Re
         }
         Some(RefPicListModifications::I) | None => return Ok(Vec::new()),
     };
+    // Spec 7.4.3.1: the number of reordering commands may not exceed
+    // num_ref_idx_l0_active_minus1 + 1, because 8.2.4.3.1 places command i at
+    // index i of a list that is only that long. The bound is a conformance
+    // requirement, so a corrupt or hostile stream can break it; reject the
+    // slice here rather than let the reorder run off the end of the list.
+    if commands.len() > num_ref_idx_l0 {
+        return Err(decode(format!(
+            "ref_pic_list_modification carries {} commands for {num_ref_idx_l0} active reference indices",
+            commands.len()
+        )));
+    }
     let mut out = Vec::with_capacity(commands.len());
     for command in commands {
         match command {
@@ -611,8 +626,26 @@ mod tests {
         let modified = Some(RefPicListModifications::P {
             ref_pic_list_modification_l0: vec![ModificationOfPicNums::LongTermRef(0)],
         });
-        let err = short_term_list_mods(&modified).unwrap_err();
+        let err = short_term_list_mods(&modified, 1).unwrap_err();
         assert!(err.to_string().contains("long-term"));
+    }
+
+    #[test]
+    fn ref_pic_list_modification_longer_than_list0_is_rejected() {
+        let modified = Some(RefPicListModifications::P {
+            ref_pic_list_modification_l0: vec![
+                ModificationOfPicNums::Subtract(0),
+                ModificationOfPicNums::Subtract(0),
+            ],
+        });
+        let err = short_term_list_mods(&modified, 1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("carries 2 commands for 1 active reference indices"),
+            "{err}"
+        );
+        // The same commands are legal once list 0 is long enough to hold them.
+        assert_eq!(short_term_list_mods(&modified, 2).unwrap().len(), 2);
     }
 
     #[test]

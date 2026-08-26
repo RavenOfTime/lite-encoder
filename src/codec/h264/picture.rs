@@ -299,6 +299,16 @@ impl Dpb {
         num_active: usize,
     ) -> Result<Vec<&Picture>, crate::Error> {
         let num_active = num_active.max(1);
+        // Spec 7.4.3.1 bounds the command count by num_ref_idx_l0_active_minus1
+        // + 1, because 8.2.4.3.1 below writes command i at index i. The slice
+        // header rejects an overrun already; repeat the check here so no caller
+        // can turn stream-controlled syntax into an out-of-bounds write.
+        if mods.len() > num_active {
+            return Err(crate::Error::Decode(format!(
+                "ref_pic_list_modification carries {} commands for {num_active} active reference indices",
+                mods.len()
+            )));
+        }
         let mut list: Vec<Option<&Picture>> = self.refs.iter().map(Some).collect();
         list.resize(num_active + 1, None);
 
@@ -611,6 +621,29 @@ mod tests {
             list.iter().map(|p| p.frame_num).collect::<Vec<_>>(),
             vec![2, 3, 1]
         );
+    }
+
+    #[test]
+    fn list0_rejects_more_modifications_than_active_reference_indices() {
+        let mut dpb = Dpb::new(3, 16);
+        let _ = dpb.push(picture_numbered(0));
+        let _ = dpb.push(picture_numbered(1));
+        let _ = dpb.push(picture_numbered(2));
+        // Every command here resolves to a real picture, so the missing-PicNum
+        // path cannot catch it; only the 7.4.3.1 count bound can.
+        let mods = [
+            RefListMod::Subtract(0),
+            RefListMod::Subtract(0),
+            RefListMod::Subtract(0),
+        ];
+        let err = dpb.list0(3, &mods, 1).expect_err("overlong command list");
+        assert!(
+            err.to_string()
+                .contains("carries 3 commands for 1 active reference indices"),
+            "{err}"
+        );
+        // A list long enough to hold the commands still reorders normally.
+        assert!(dpb.list0(3, &mods, 3).is_ok());
     }
 
     #[test]
