@@ -1,7 +1,8 @@
-"""Independent structural validator for the WebM files we emit.
+"""Independent structural validator for the WebM/Matroska files we emit.
 
 Walks the EBML tree without using any of the muxer's own logic, so it catches
 VINT/size mistakes that the Rust unit tests could agree with by construction.
+Accepts both the `webm` DocType (`WebmMuxer`) and `matroska` (`MkvMuxer`).
 
 Usage: python tools/ebml_check.py FILE
 """
@@ -101,8 +102,9 @@ def main():
 
     doctype = b"\x42\x82"
     i = data.find(doctype)
-    if i < 0 or b"webm" not in data[i:i + 16]:
-        errors.append("DocType is not 'webm'; browsers will reject the file")
+    window = data[i:i + 16] if i >= 0 else b""
+    if i < 0 or (b"webm" not in window and b"matroska" not in window):
+        errors.append("DocType is neither 'webm' nor 'matroska'")
 
     print("\nparsed %d elements, %d clusters, %d blocks over %d bytes"
           % (stats["elements"], stats["clusters"], stats["blocks"], len(data)))

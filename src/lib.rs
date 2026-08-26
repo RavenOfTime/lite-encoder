@@ -9,8 +9,12 @@
 //! on the roadmap.
 
 pub mod codec;
+pub mod demux;
 pub mod media;
 pub mod mux;
+pub mod probe;
+pub mod registry;
+pub mod remux;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

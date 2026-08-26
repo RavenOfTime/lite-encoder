@@ -45,9 +45,12 @@ cargo build --release
 | **H.264 decode** | Pure Rust, differentially tested vs OpenH264 (`reference-decoder`) |
 | **AV1 encode** | rav1e, optional `--features av1` |
 | **WebM mux** | EBML/Matroska subset, structurally validated (`tools/ebml_check.py`) |
-| **Annex B read** | Elementary H.264 for benches and examples |
-| **Demux (MP4/MKV/TS/…)** | Not started |
-| **Remux / `-c copy`** | Not started |
+| **Annex B read** | `demux::AnnexBDemuxer` — elementary H.264, one video track |
+| **MKV mux/demux** | `mux::MkvMuxer` + `demux::MkvDemuxer` — full Matroska codec list (H.264 included); SimpleBlock only, 1 ms `TimestampScale` only |
+| **`Demuxer` / `Muxer` traits** | `demux`, `mux`; impls: `AnnexBDemuxer`, `MkvDemuxer`, `WebmMuxer`, `MkvMuxer` |
+| **`-c copy` remux** | `remux::copy_remux` — no decode, packets straight to muxer |
+| **`Probe`** | `probe::probe()` — magic bytes + extension, container only (no track parse yet) |
+| **Demux/mux (MP4/fMP4, TS)** | Not started |
 | **CLI** | **`liteenc`** stub only — `./target/release/liteenc --help` |
 
 ### Out of scope (removed from product)
@@ -64,7 +67,7 @@ Legend: **Y** supported, **P** planned, **—** later / evaluate.
 |---|---|---|---|
 | Annex B (`.h264`) | **Y** | P | Elementary; today’s bench path |
 | WebM | — | **Y** | AV1/VP8/VP9 + Vorbis/Opus only |
-| Matroska (`.mkv`) | P | P | Remux target |
+| Matroska (`.mkv`) | **Y** | **Y** | Full codec list; SimpleBlock only, no lacing |
 | MP4 / fMP4 | P | P | Remux + browser MSE path |
 | MPEG-TS | P | — | Common broadcast/capture |
 
@@ -92,7 +95,11 @@ release. See [`todo.md`](todo.md) for the ordered checklist.
 ```text
 src/codec/     decoders and encoders (H.264, AV1, …)
 src/media/     Codec, Frame, Packet, Decoder/Encoder traits, time base
-src/mux/       EBML and WebM muxer
+src/demux/     Demuxer trait; AnnexBDemuxer, MkvDemuxer
+src/mux/       Muxer trait; EBML + shared Matroska core; WebmMuxer, MkvMuxer
+src/probe.rs   container sniff (magic bytes + extension)
+src/registry.rs  (container, codec) → read/write support table
+src/remux.rs   `-c copy`: demuxer packets straight to a muxer, no decode
 tools/         independent validators
 examples/      decode benches, diff, write_webm, transcode experiments
 tests/         fixtures and integration tests

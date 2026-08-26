@@ -50,16 +50,23 @@ impl Codec {
         )
     }
 
-    /// The Matroska `CodecID` string, for codecs we can mux.
+    /// The Matroska `CodecID` string, for codecs we can mux into Matroska.
+    ///
+    /// A strict superset of what WebM accepts: [`Codec::webm_legal`] narrows
+    /// this further for [`crate::mux::WebmMuxer`].
     pub fn matroska_id(self) -> Option<&'static str> {
         Some(match self {
+            Codec::H264 => "V_MPEG4/ISO/AVC",
+            Codec::H265 => "V_MPEGH/ISO/HEVC",
             Codec::Av1 => "V_AV1",
             Codec::Vp9 => "V_VP9",
             Codec::Vp8 => "V_VP8",
+            Codec::Aac => "A_AAC",
             Codec::Opus => "A_OPUS",
             Codec::Vorbis => "A_VORBIS",
-            // Legal in Matroska but *not* in WebM; we don't emit these.
-            _ => return None,
+            // No plain Matroska CodecID for G.711; it rides inside an ACM
+            // wrapper we do not build. Out of scope until something needs it.
+            Codec::Pcmu | Codec::Pcma => return None,
         })
     }
 }
