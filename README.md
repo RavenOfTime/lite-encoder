@@ -139,11 +139,13 @@ AV1 encode and OS jitter on the same box. The four-picture fixture is too short
 to use as the gate. Measured 2026-08-26: ~129 fps (4.3× @ 30); OpenH264 ~222 fps.
 
 **Encode throughput gate:** best pass of `bench_av1` on the same capture must
-reach **≥30 fps** (1.0× @ 30 fps) using the shipping `Av1Encoder` (speed 8,
-4 tiles, low latency, 2 Mbit/s). Measured 2026-08-26 on the four-picture
-fixture only (gate skipped): ~5.3 fps — well below real time; 1080p continuous
-recording needs a different resolution, preset, or thread budget before the
-runner is built.
+reach **≥30 fps** (1.0× @ 30 fps) using the shipping `Av1Encoder` (speed 10,
+16 tiles, low latency, 2 Mbit/s). A 224-picture release sweep measured
+4/8/16 low-latency tiles at **10.3/14.5/16.3 fps** and approximately
+2.52/2.54/2.55 Mbit/s. Normal latency was slower at every tile count
+(6.9/10.3/11.7 fps). Even the best candidate reaches only 0.54× real time,
+and speed 9/10 with 16 low-latency tiles reached **18.0/30.1 fps**. Speed 10
+passes the gate, with ~2.90 Mbit/s observed output and a 14-frame startup delay.
 
     cargo test
     cargo test --features reference-decoder codec::h264::differential

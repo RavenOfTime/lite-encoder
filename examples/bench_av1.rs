@@ -17,7 +17,7 @@
 
 use std::time::{Duration, Instant};
 
-use lite_encoder::codec::av1::Av1Encoder;
+use lite_encoder::codec::av1::{Av1Encoder, Av1Settings};
 use lite_encoder::codec::h264::{annexb, decoder::Frontend};
 use lite_encoder::media::{Encoder, Frame, TrackId};
 
@@ -50,15 +50,31 @@ fn decode_all(data: &[u8]) -> BenchResult {
 fn encode_all(
     frames: &[Frame],
     size: (u32, u32),
-) -> Result<(Duration, usize), Box<dyn std::error::Error>> {
-    let mut enc = Av1Encoder::new(TrackId(0), size.0, size.1, FPS, BITRATE_1080P)?;
+    settings: Av1Settings,
+) -> Result<(Duration, usize, usize, usize), Box<dyn std::error::Error>> {
+    let mut enc =
+        Av1Encoder::with_settings(TrackId(0), size.0, size.1, FPS, BITRATE_1080P, settings)?;
     let start = Instant::now();
     let mut packets = 0usize;
-    for frame in frames {
-        packets += enc.encode(frame)?.len();
+    let mut bytes = 0usize;
+    let mut first_packet_after = None;
+    for (index, frame) in frames.iter().enumerate() {
+        let output = enc.encode(frame)?;
+        if first_packet_after.is_none() && !output.is_empty() {
+            first_packet_after = Some(index + 1);
+        }
+        packets += output.len();
+        bytes += output.iter().map(|packet| packet.data.len()).sum::<usize>();
     }
-    packets += enc.flush()?.len();
-    Ok((start.elapsed(), packets))
+    let output = enc.flush()?;
+    packets += output.len();
+    bytes += output.iter().map(|packet| packet.data.len()).sum::<usize>();
+    Ok((
+        start.elapsed(),
+        packets,
+        bytes,
+        first_packet_after.unwrap_or(frames.len()),
+    ))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -68,7 +84,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let passes: usize = std::env::args()
         .nth(2)
         .and_then(|v| v.parse().ok())
-        .unwrap_or(3);
+        .unwrap_or(1);
+    let speed_only = std::env::args().nth(3).as_deref() == Some("speed");
 
     let data = std::fs::read(&input)?;
     let access_units = annexb::access_units(&data);
@@ -90,40 +107,112 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frames.len() as f64 / decode_elapsed.as_secs_f64()
     );
 
-    let mut best = Duration::MAX;
-    let mut packets = 0usize;
-    for pass in 0..passes {
-        let (elapsed, pass_packets) = encode_all(&frames, size)?;
-        let fps = frames.len() as f64 / elapsed.as_secs_f64();
+    println!("\nspeed  tiles  latency  threads      fps    kbit/s  first-packet");
+    let mut best_fps = 0.0f64;
+    let mut best_settings = Av1Settings::default();
+    let all_candidates = [
+        Av1Settings {
+            tiles: 4,
+            ..Av1Settings::default()
+        },
+        Av1Settings {
+            tiles: 8,
+            ..Av1Settings::default()
+        },
+        Av1Settings {
+            tiles: 16,
+            ..Av1Settings::default()
+        },
+        Av1Settings {
+            tiles: 4,
+            low_latency: false,
+            ..Av1Settings::default()
+        },
+        Av1Settings {
+            tiles: 8,
+            low_latency: false,
+            ..Av1Settings::default()
+        },
+        Av1Settings {
+            tiles: 16,
+            low_latency: false,
+            ..Av1Settings::default()
+        },
+        Av1Settings {
+            speed: 9,
+            tiles: 16,
+            ..Av1Settings::default()
+        },
+        Av1Settings {
+            speed: 10,
+            tiles: 16,
+            ..Av1Settings::default()
+        },
+    ];
+    let candidates: &[Av1Settings] = if speed_only {
+        &all_candidates[6..]
+    } else {
+        &all_candidates
+    };
+    for &settings in candidates {
+        let mut best = Duration::MAX;
+        let mut best_bytes = 0usize;
+        let mut first_packet_after = 0usize;
+        for _ in 0..passes {
+            let (elapsed, _packets, bytes, delay) = encode_all(&frames, size, settings)?;
+            if elapsed < best {
+                best = elapsed;
+                best_bytes = bytes;
+                first_packet_after = delay;
+            }
+        }
+        let fps = frames.len() as f64 / best.as_secs_f64();
+        let media_seconds = frames.len() as f64 / f64::from(FPS);
+        let kbit_s = best_bytes as f64 * 8.0 / media_seconds / 1000.0;
         println!(
-            "encode pass {pass}: {} frames, {pass_packets} packets in {elapsed:?} ({fps:.1} fps)",
-            frames.len(),
+            "{:>5}  {:>5}  {:>7}  {:>7}  {:>7.1}  {:>8.1}  {:>12}",
+            settings.speed,
+            settings.tiles,
+            if settings.low_latency {
+                "low"
+            } else {
+                "normal"
+            },
+            settings.threads,
+            fps,
+            kbit_s,
+            first_packet_after
         );
-        packets = pass_packets;
-        best = best.min(elapsed);
+        if fps > best_fps {
+            best_fps = fps;
+            best_settings = settings;
+        }
     }
 
-    let fps = frames.len() as f64 / best.as_secs_f64();
     println!(
-        "\nbest encode: {:.1} fps at {}x{} ({:.2} ms/frame, {} packets)",
-        fps,
+        "\nbest candidate: {:.1} fps at {}x{} (tiles {}, {} latency)",
+        best_fps,
         size.0,
         size.1,
-        best.as_secs_f64() * 1000.0 / frames.len() as f64,
-        packets,
+        best_settings.tiles,
+        if best_settings.low_latency {
+            "low"
+        } else {
+            "normal"
+        },
     );
     for target in [25.0, 30.0] {
-        println!("  {:.2}x real time at {target} fps", fps / target);
+        println!("  {:.2}x real time at {target} fps", best_fps / target);
     }
 
     let gate_applies = size == (1920, 1080) && frames.len() >= 200;
     if gate_applies {
-        let margin = fps / MIN_ENCODE_FPS_1080P;
+        let margin = best_fps / MIN_ENCODE_FPS_1080P;
         println!(
             "\nacceptance gate: {:.0} fps min encode at 1080p (1.0× @ 30 fps)",
             MIN_ENCODE_FPS_1080P
         );
-        if fps >= MIN_ENCODE_FPS_1080P {
+        if best_fps >= MIN_ENCODE_FPS_1080P {
             println!("  PASS ({margin:.2}× the floor)");
         } else {
             println!("  FAIL ({margin:.2}× the floor)");

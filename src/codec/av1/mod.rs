@@ -1,9 +1,8 @@
 //! AV1 encoding via rav1e, gated behind the `av1` feature.
 //!
-//! Configuration mirrors `examples/bench_rav1e.rs`: speed 8, 4 tiles, low
-//! latency. That combination measured ~2x real time at 640x360, the shape
-//! the transcode target actually produces, so it is the only preset wired up
-//! here rather than a knob left for callers to tune.
+//! The shipping configuration is speed 10, 16 tiles, low latency. It measured
+//! 30.1 fps over the 224-picture 1080p camera capture; speed 9 reached only
+//! 18.0 fps. See `examples/bench_av1.rs` for the reproducible sweep.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -30,6 +29,52 @@ pub struct Av1Encoder {
     force_keyframe: bool,
 }
 
+/// Performance-sensitive rav1e settings exposed for benchmark-driven product
+/// selection. Defaults are the current shipping configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct Av1Settings {
+    pub speed: u8,
+    pub tiles: usize,
+    pub low_latency: bool,
+    /// Zero lets rav1e use its global Rayon pool.
+    pub threads: usize,
+}
+
+impl Default for Av1Settings {
+    fn default() -> Self {
+        Self {
+            speed: 10,
+            tiles: 16,
+            low_latency: true,
+            threads: 0,
+        }
+    }
+}
+
+impl Av1Settings {
+    /// Builds the rav1e configuration these settings describe.
+    ///
+    /// Exposed so benchmarks measure the shipping configuration itself rather
+    /// than a copy that can drift from it. `bitrate` is in bits per second.
+    pub fn encoder_config(&self, width: u32, height: u32, fps: u32, bitrate: i32) -> EncoderConfig {
+        let fps = u64::from(fps.max(1));
+        EncoderConfig {
+            width: width as usize,
+            height: height as usize,
+            bit_depth: 8,
+            chroma_sampling: ChromaSampling::Cs420,
+            time_base: Rational::new(1, fps),
+            speed_settings: SpeedSettings::from_preset(self.speed),
+            bitrate,
+            low_latency: self.low_latency,
+            tiles: self.tiles,
+            min_key_frame_interval: fps * 2,
+            max_key_frame_interval: fps * 2,
+            ..Default::default()
+        }
+    }
+}
+
 impl Av1Encoder {
     /// `bitrate` is in bits per second. `fps` only sets the keyframe
     /// interval (2 seconds, matching the benchmarked configuration) and the
@@ -42,23 +87,22 @@ impl Av1Encoder {
         fps: u32,
         bitrate: i32,
     ) -> Result<Self, Error> {
-        let fps = u64::from(fps.max(1));
-        let enc = EncoderConfig {
-            width: width as usize,
-            height: height as usize,
-            bit_depth: 8,
-            chroma_sampling: ChromaSampling::Cs420,
-            time_base: Rational::new(1, fps),
-            speed_settings: SpeedSettings::from_preset(8),
-            bitrate,
-            low_latency: true,
-            tiles: 4,
-            min_key_frame_interval: fps * 2,
-            max_key_frame_interval: fps * 2,
-            ..Default::default()
-        };
+        Self::with_settings(track, width, height, fps, bitrate, Av1Settings::default())
+    }
 
-        let cfg = Config::new().with_encoder_config(enc);
+    pub fn with_settings(
+        track: TrackId,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: i32,
+        settings: Av1Settings,
+    ) -> Result<Self, Error> {
+        let enc = settings.encoder_config(width, height, fps, bitrate);
+
+        let cfg = Config::new()
+            .with_encoder_config(enc)
+            .with_threads(settings.threads);
         let ctx = cfg
             .new_context()
             .map_err(|e| Error::Encode(format!("rav1e: {e:?}")))?;
