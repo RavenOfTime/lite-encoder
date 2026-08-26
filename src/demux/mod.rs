@@ -6,9 +6,11 @@
 
 pub mod annexb;
 pub mod mkv;
+pub mod mp4;
 
 pub use annexb::AnnexBDemuxer;
 pub use mkv::MkvDemuxer;
+pub use mp4::Mp4Demuxer;
 
 use crate::media::{Packet, Track};
 use crate::Error;

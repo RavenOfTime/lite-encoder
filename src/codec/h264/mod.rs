@@ -47,6 +47,7 @@
 //! `differential`, behind the off-by-default `reference-decoder` feature.
 
 pub mod annexb;
+pub mod avcc;
 pub mod cabac;
 pub mod cabac_tables;
 pub mod deblock;
