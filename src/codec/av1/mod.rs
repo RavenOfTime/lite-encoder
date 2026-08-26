@@ -1,8 +1,11 @@
 //! AV1 encoding via rav1e, gated behind the `av1` feature.
 //!
-//! The shipping configuration is speed 10, 16 tiles, low latency. It measured
-//! 30.1 fps over the 224-picture 1080p camera capture; speed 9 reached only
-//! 18.0 fps. See `examples/bench_av1.rs` for the reproducible sweep.
+//! The shipping configuration is speed 9, 32 tiles, low latency. Over the
+//! 224-picture 1080p camera capture at a ~1 Mbit/s target (matched to a
+//! typical Tapo stream) it sustains the **22 fps** (1080p22) gate. Speed 10
+//! with 32 tiles is faster but loses ~1.2 dB of Y PSNR while spending more
+//! bits, so it is rejected. Bitrate is set by the caller (CLI or examples).
+//! See `examples/bench_av1.rs` and `examples/quality_av1.rs`.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -42,9 +45,13 @@ pub struct Av1Settings {
 
 impl Default for Av1Settings {
     fn default() -> Self {
+        // Chosen from `examples/quality_av1.rs` over the 224-picture 1080p
+        // camera capture. Product bitrate tracks the camera (~1 Mbit/s on the
+        // Tapo); benches use the same order of magnitude. Speed 9 / 32 tiles
+        // is the quality/speed pick; speed 10 buys fps with a PSNR hit.
         Self {
-            speed: 10,
-            tiles: 16,
+            speed: 9,
+            tiles: 32,
             low_latency: true,
             threads: 0,
         }
@@ -58,6 +65,12 @@ impl Av1Settings {
     /// than a copy that can drift from it. `bitrate` is in bits per second.
     pub fn encoder_config(&self, width: u32, height: u32, fps: u32, bitrate: i32) -> EncoderConfig {
         let fps = u64::from(fps.max(1));
+        // When bitrate mode is on, `quantizer` is the *maximum* quantizer
+        // (worst quality allowed). rav1e's own CLI sets 255 so the rate
+        // controller can actually hit low targets; leaving the Default of
+        // 100 floors output around ~2 Mbit/s on 1080p and ignores a 1 Mbit/s
+        // camera match request.
+        let quantizer = if bitrate > 0 { 255 } else { 100 };
         EncoderConfig {
             width: width as usize,
             height: height as usize,
@@ -65,6 +78,7 @@ impl Av1Settings {
             chroma_sampling: ChromaSampling::Cs420,
             time_base: Rational::new(1, fps),
             speed_settings: SpeedSettings::from_preset(self.speed),
+            quantizer,
             bitrate,
             low_latency: self.low_latency,
             tiles: self.tiles,

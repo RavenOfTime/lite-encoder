@@ -1,0 +1,2 @@
+    Finished `release` profile [optimized] target(s) in 0.26s
+     Running `target\release\examples\rtsp_to_webm.exe live_tapo.h264 prof_one.webm`

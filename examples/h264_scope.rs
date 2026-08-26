@@ -8,7 +8,9 @@
 //! Run with:
 //!   cargo run --release --example h264_scope -- probe.h264
 //!
-//! Capture a dump first with `rtsp_probe --dump`.
+//! Inspect which H.264 tools a capture uses (reference handling, slice types).
+//!
+//! Input is Annex B elementary stream (e.g. from a camera dump or test fixture).
 
 use std::collections::BTreeMap;
 
@@ -116,7 +118,7 @@ fn main() {
     let path = match std::env::args().nth(1) {
         Some(p) => p,
         None => {
-            eprintln!("usage: h264_scope <file.h264>   (Annex B, from rtsp_probe --dump)");
+            eprintln!("usage: h264_scope <file.h264>   (Annex B elementary stream)");
             std::process::exit(2);
         }
     };

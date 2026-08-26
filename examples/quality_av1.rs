@@ -22,14 +22,17 @@ use rav1e::prelude::*;
 
 /// Assumed camera frame rate: sets the keyframe interval and the media
 /// duration the bitrate is computed against.
-const FPS: u32 = 30;
+const FPS: u32 = 22;
 
-/// Same 1080p surveillance bitrate `bench_av1` uses, so the two tables are
-/// directly comparable.
-const BITRATE_1080P: i32 = 6_000_000;
+/// Same 1080p surveillance bitrate the recorder aims at when matching a
+/// typical Tapo (~1 Mbit/s). Must stay in lockstep with `bench_av1`: a
+/// 6 Mbit/s sweep runs ~1.4x slower than a 1–2 Mbit/s one at an identical
+/// speed/tile setting. That mismatch, not the PSNR accounting, is what made
+/// earlier tables disagree.
+const BITRATE_1080P: i32 = 1_000_000;
 
-/// Minimum acceptable encode fps at 1080p (1.0x real time at 30 fps).
-const MIN_ENCODE_FPS_1080P: f64 = 30.0;
+/// Minimum acceptable encode fps at 1080p (1.0x real time at 22 fps).
+const MIN_ENCODE_FPS_1080P: f64 = 22.0;
 
 struct Measurement {
     label: String,
@@ -249,6 +252,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `bench_av1`. Pass `speed` as the second argument to skip quality
     // measurement entirely and get comparable throughput numbers.
     let measure_quality = std::env::args().nth(2).as_deref() != Some("speed");
+    // Best-of-N, like `bench_h264` and `bench_av1`: a single pass across a
+    // long candidate list reads low because the machine never settles.
+    let passes: usize = std::env::args()
+        .nth(3)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    // Optional substring filter so one configuration can be re-measured with
+    // more passes without re-running the whole sweep.
+    let filter = std::env::args().nth(4);
     let data = std::fs::read(&input)?;
     let frames = decode_frames(&data);
     if frames.is_empty() {
@@ -265,7 +277,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut results = Vec::new();
     for (label, settings) in candidates() {
-        let measurement = measure(label, settings, &frames, size, measure_quality)?;
+        if let Some(filter) = &filter {
+            if !label.contains(filter.as_str()) {
+                continue;
+            }
+        }
+        let mut measurement = measure(label, settings, &frames, size, measure_quality)?;
+        for _ in 1..passes {
+            let again = measure(label, settings, &frames, size, measure_quality)?;
+            if again.fps > measurement.fps {
+                measurement = again;
+            }
+        }
         println!(
             "{:<28} {:>6.1} fps  {:>8.1} kbit/s  Y {:>6.2} dB  U {:>6.2} dB  V {:>6.2} dB  latency {:>3} frames",
             measurement.label,

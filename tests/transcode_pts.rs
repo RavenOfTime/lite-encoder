@@ -25,7 +25,7 @@ fn decode_then_encode_preserves_pts_on_the_job_timeline() {
         frames.push(decoded.into_iter().next().unwrap());
     }
 
-    let mut encoder = Av1Encoder::new(TrackId(1), 1920, 1080, 30, 2_000_000).unwrap();
+    let mut encoder = Av1Encoder::new(TrackId(1), 1920, 1080, 30, 1_000_000).unwrap();
     for frame in &frames {
         encoder.encode(frame).expect("encode");
     }

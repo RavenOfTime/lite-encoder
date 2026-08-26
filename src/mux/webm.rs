@@ -69,8 +69,8 @@ impl<W: Write> WebmMuxer<W> {
     fn write_info(out: &mut Vec<u8>) {
         let mut b = Vec::new();
         ebml::write_uint(&mut b, id::TIMESTAMP_SCALE, time::WEBM_TIMESTAMP_SCALE_NS);
-        ebml::write_string(&mut b, id::MUXING_APP, "lite-encoder");
-        ebml::write_string(&mut b, id::WRITING_APP, "lite-encoder");
+        ebml::write_string(&mut b, id::MUXING_APP, "liteenc");
+        ebml::write_string(&mut b, id::WRITING_APP, "liteenc");
         // Duration is deliberately omitted: it is unknown while recording,
         // and players treat its absence as "live".
         ebml::write_master(out, id::INFO, &b);

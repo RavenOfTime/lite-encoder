@@ -1,28 +1,24 @@
-//! lite-encoder: a focused media processor.
+//! lite-encoder: a Rust-native ffmpeg alternative.
 //!
-//! Scope is deliberately narrow. It ingests RTSP, supervises long-running
-//! recording jobs, reports on them continuously, and writes WebM. It is not
-//! a general format converter.
+//! Demux, decode, encode, and mux through one pipeline. Codecs are implemented
+//! in Rust where we own correctness; containers and encoders are added behind
+//! the same traits, prioritized in [`README.md`] and `todo.md`.
 //!
-//! The one constraint that shapes everything: WebM is a Matroska subset that
-//! only permits VP8/VP9/AV1 video and Vorbis/Opus audio, while RTSP cameras
-//! send H.264/H.265. So there is no such thing as a cheap RTSP-to-WebM
-//! remux; that path always decodes and re-encodes. See [`job::Treatment`].
+//! Today: pure-Rust H.264 decode, optional AV1 encode (rav1e), WebM mux,
+//! Annex B elementary read for benches. Demuxers, remux/copy, and the CLI are
+//! on the roadmap.
 
 pub mod codec;
-pub mod job;
 pub mod media;
 pub mod mux;
-pub mod source;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The job description itself is impossible; caught before any I/O.
-    #[error("invalid job spec: {0}")]
+    #[error("invalid argument: {0}")]
     Spec(String),
 
-    #[error("source error: {0}")]
-    Source(String),
+    #[error("demux error: {0}")]
+    Demux(String),
 
     #[error("decode error: {0}")]
     Decode(String),

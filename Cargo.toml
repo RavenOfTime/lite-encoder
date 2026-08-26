@@ -3,21 +3,19 @@ name = "lite-encoder"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.98"
-description = "Pure-Rust media stack: decode camera codecs (H.264 today, H.265 next), export WebM and other optimized formats — a focused ffmpeg alternative, not a format zoo."
+description = "Rust-native ffmpeg alternative: demux, decode, encode, mux — formats added by priority behind one pipeline."
+
+[[bin]]
+name = "liteenc"
+path = "src/bin/liteenc.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs"] }
-futures = "0.3"
-retina = "0.4"
 h264-reader = "0.8"
 bytes = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-url = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
 
 [features]
 default = []
@@ -48,8 +46,20 @@ required-features = ["av1"]
 name = "bench_av1"
 required-features = ["av1"]
 
+[[example]]
+name = "quality_av1"
+required-features = ["av1"]
+
+[[example]]
+name = "bench_av1_parallel"
+required-features = ["av1"]
+
 [[test]]
 name = "transcode_pts"
+required-features = ["av1"]
+
+[[test]]
+name = "transcode_webm"
 required-features = ["av1"]
 
 [[example]]
