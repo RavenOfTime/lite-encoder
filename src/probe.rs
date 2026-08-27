@@ -19,6 +19,52 @@ pub enum Container {
     MpegTs,
 }
 
+impl Container {
+    /// Every container this build knows, in matrix order.
+    pub const ALL: &'static [Container] = &[
+        Container::AnnexB,
+        Container::WebM,
+        Container::Matroska,
+        Container::Mp4,
+        Container::MpegTs,
+    ];
+
+    /// The CLI's name for this container, as accepted by `liteenc -f`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Container::AnnexB => "annexb",
+            Container::WebM => "webm",
+            Container::Matroska => "matroska",
+            Container::Mp4 => "mp4",
+            Container::MpegTs => "mpegts",
+        }
+    }
+
+    /// Parse a `-f` format name, accepting the file extensions as aliases so
+    /// `-f mkv` and `-f matroska` both work (ffmpeg accepts the same pair).
+    pub fn from_name(name: &str) -> Option<Container> {
+        let lower = name.to_ascii_lowercase();
+        if let Some(c) = Container::ALL.iter().find(|c| c.name() == lower) {
+            return Some(*c);
+        }
+        sniff_extension_str(&lower)
+    }
+}
+
+impl std::fmt::Display for Container {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The container an output path's extension implies.
+///
+/// An output file has no bytes to sniff yet, so this is all the CLI has to go
+/// on when `-f` is absent.
+pub fn container_from_path(path: &Path) -> Option<Container> {
+    sniff_extension(path)
+}
+
 /// Identify `data`'s container.
 ///
 /// `path` is an optional hint used when magic bytes are ambiguous or `data`
@@ -78,7 +124,11 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn sniff_extension(path: &Path) -> Option<Container> {
-    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+    sniff_extension_str(&path.extension()?.to_str()?.to_ascii_lowercase())
+}
+
+fn sniff_extension_str(ext: &str) -> Option<Container> {
+    match ext {
         "h264" | "264" | "avc" | "annexb" => Some(Container::AnnexB),
         "webm" => Some(Container::WebM),
         "mkv" => Some(Container::Matroska),
@@ -132,6 +182,26 @@ mod tests {
             probe(&data, Some(Path::new("clip.mkv"))).unwrap(),
             Container::Matroska
         );
+    }
+
+    #[test]
+    fn names_round_trip_through_from_name() {
+        for c in Container::ALL {
+            assert_eq!(Container::from_name(c.name()), Some(*c));
+        }
+        assert_eq!(Container::from_name("mkv"), Some(Container::Matroska));
+        assert_eq!(Container::from_name("MP4"), Some(Container::Mp4));
+        assert_eq!(Container::from_name("ts"), Some(Container::MpegTs));
+        assert_eq!(Container::from_name("ogg"), None);
+    }
+
+    #[test]
+    fn output_container_comes_from_the_extension() {
+        assert_eq!(
+            container_from_path(Path::new("out.webm")),
+            Some(Container::WebM)
+        );
+        assert_eq!(container_from_path(Path::new("out")), None);
     }
 
     #[test]

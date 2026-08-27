@@ -21,10 +21,12 @@ pub fn support(container: Container, codec: Codec) -> Support {
             read: codec == Codec::H264,
             write: false,
         },
-        // WebM is a Matroska subset restricted to a handful of codecs, and we
-        // only ever produce it, never read it back.
+        // WebM is a Matroska subset restricted to a handful of codecs. Both
+        // directions: `MkvDemuxer` reads it unchanged (DocType is not
+        // load-bearing for the element walk), so a WebM this crate wrote can
+        // be read back.
         Container::WebM => Support {
-            read: false,
+            read: codec.webm_legal(),
             write: codec.webm_legal(),
         },
         // Full Matroska: any codec with a Matroska CodecID, both directions.
@@ -65,11 +67,13 @@ mod tests {
     }
 
     #[test]
-    fn webm_writes_only_webm_legal_codecs() {
+    fn webm_carries_only_webm_legal_codecs() {
         assert!(can_write(Container::WebM, Codec::Av1));
         assert!(can_write(Container::WebM, Codec::Opus));
         assert!(!can_write(Container::WebM, Codec::H264));
-        assert!(!can_read(Container::WebM, Codec::Av1));
+        // Read is via `MkvDemuxer`; see `demux::mkv` round-trip test.
+        assert!(can_read(Container::WebM, Codec::Av1));
+        assert!(!can_read(Container::WebM, Codec::H264));
     }
 
     #[test]

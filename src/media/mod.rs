@@ -50,6 +50,58 @@ impl Codec {
         )
     }
 
+    /// Every codec this crate has a name for, in matrix order.
+    ///
+    /// Exists so `liteenc formats` and the registry tests can enumerate the
+    /// support matrix instead of restating it.
+    pub const ALL: &'static [Codec] = &[
+        Codec::H264,
+        Codec::H265,
+        Codec::Av1,
+        Codec::Vp9,
+        Codec::Vp8,
+        Codec::Aac,
+        Codec::Pcmu,
+        Codec::Pcma,
+        Codec::Opus,
+        Codec::Vorbis,
+    ];
+
+    /// The CLI's name for this codec. ffmpeg's spelling wherever one exists,
+    /// so `-c:v h264` and `-c:a opus` mean what a user already expects.
+    pub fn name(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264",
+            Codec::H265 => "hevc",
+            Codec::Av1 => "av1",
+            Codec::Vp9 => "vp9",
+            Codec::Vp8 => "vp8",
+            Codec::Aac => "aac",
+            Codec::Pcmu => "pcm_mulaw",
+            Codec::Pcma => "pcm_alaw",
+            Codec::Opus => "opus",
+            Codec::Vorbis => "vorbis",
+        }
+    }
+
+    /// Parse a CLI codec name, accepting the common aliases too.
+    pub fn from_name(name: &str) -> Option<Codec> {
+        let lower = name.to_ascii_lowercase();
+        if let Some(c) = Codec::ALL.iter().find(|c| c.name() == lower) {
+            return Some(*c);
+        }
+        Some(match lower.as_str() {
+            "avc" | "avc1" | "x264" => Codec::H264,
+            "h265" | "hvc1" => Codec::H265,
+            "libaom-av1" | "librav1e" => Codec::Av1,
+            "libopus" => Codec::Opus,
+            "libvorbis" => Codec::Vorbis,
+            "mulaw" | "g711u" => Codec::Pcmu,
+            "alaw" | "g711a" => Codec::Pcma,
+            _ => return None,
+        })
+    }
+
     /// The Matroska `CodecID` string, for codecs we can mux into Matroska.
     ///
     /// A strict superset of what WebM accepts: [`Codec::webm_legal`] narrows

@@ -411,6 +411,41 @@ mod tests {
         assert!(MkvDemuxer::new(&[0xff; 16]).is_err());
     }
 
+    /// WebM differs from Matroska only in DocType and its codec list, so this
+    /// reader covers both — which is what `registry::support` claims for
+    /// `Container::WebM`'s read cell, and what lets `liteenc probe` open a
+    /// `.webm` this crate just wrote.
+    #[test]
+    fn reads_back_a_webm_written_by_the_webm_muxer() {
+        let track = Track {
+            id: TrackId(1),
+            codec: Codec::Av1,
+            kind: TrackKind::Video {
+                width: 640,
+                height: 360,
+            },
+            extra_data: vec![0x81, 0x00, 0x0c, 0x00],
+        };
+
+        let mut bytes = Vec::new();
+        let mut m = crate::mux::WebmMuxer::new(&mut bytes, vec![track]).unwrap();
+        m.write_packet(&Packet {
+            track: TrackId(1),
+            pts: Duration::from_millis(0),
+            keyframe: true,
+            data: bytes::Bytes::from_static(&[7, 7, 7]),
+        })
+        .unwrap();
+        m.finalize().unwrap();
+
+        let mut demux = MkvDemuxer::new(&bytes).unwrap();
+        assert_eq!(demux.tracks().len(), 1);
+        assert_eq!(demux.tracks()[0].codec, Codec::Av1);
+        let pkt = demux.read_packet().unwrap().unwrap();
+        assert_eq!(&pkt.data[..], &[7, 7, 7]);
+        assert!(demux.read_packet().unwrap().is_none());
+    }
+
     #[test]
     fn keeps_packets_on_their_own_track_across_multiple_tracks() {
         let audio_track = Track {
